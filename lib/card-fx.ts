@@ -10,7 +10,7 @@ export type CardFx = "none" | "stipple" | "splat";
 
 export const FX_NAMES: readonly CardFx[] = ["none", "stipple", "splat"];
 
-export const DEFAULT_FX: CardFx = "stipple";
+export const DEFAULT_FX: CardFx = "none";
 
 /** The `mode` value `present.wgsl` branches on. Keep both lists in step. */
 const FX_MODE: Record<CardFx, number> = { none: 0, stipple: 1, splat: 2 };
@@ -32,7 +32,7 @@ export function resolveFx(value: string | string[] | undefined): CardFx {
  * same apparent weight on a 1x display and a 2x one, and because it is dilated
  * in screen space it does not thin out as the card turns edge-on.
  */
-export const OUTLINE_PX = 3;
+export const OUTLINE_PX = 0;
 
 /**
  * Default outline colour, sRGB 0..1. White: the page background is black, so
