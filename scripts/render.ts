@@ -1,13 +1,13 @@
 /**
  * Headless renderer and visual regression harness.
  *
- * It runs the exact geometry, shader, textures and material presets the browser
- * uses, through `vgpu/node`, and writes PNGs plus a few pixel assertions so a
- * render can be judged without a GPU or a browser.
+ * It runs the exact geometry, shaders, textures and material presets the
+ * browser uses, through `vgpu/node`, and writes PNGs plus a few pixel
+ * assertions so a render can be judged without a GPU or a browser.
  *
  *   bun run scripts/render.ts --preset titanium --out renders/titanium.png
- *   bun run scripts/render.ts --preset titanium --view back
- *   bun run scripts/render.ts --view hero --pointer 0.62,0.45 --pitch 2
+ *   bun run scripts/render.ts --fx splat --view hero --splats 8000
+ *   bun run scripts/render.ts --view hero --yaw 70 --dpr 2
  *   bun run scripts/render.ts --all
  */
 
@@ -30,13 +30,21 @@ import {
 } from "vgpu/node";
 
 import {
-  CARD_FLOOR_Y,
   CARD_HERO_PITCH,
   CARD_HERO_YAW,
   cardCameraDistance,
   createCardScene,
   type VgpuApi,
 } from "@/lib/card-scene";
+import {
+  FX_NAMES,
+  OUTLINE_COLOR,
+  OUTLINE_PX,
+  SPLAT_COUNT,
+  fxMode,
+  resolveFx,
+  type CardFx,
+} from "@/lib/card-fx";
 import {
   PRESET_NAMES,
   resolvePreset,
@@ -62,16 +70,24 @@ const FONT_DIR = `${ROOT}.fonts`;
 /**
  * Page background, matching the forced-dark `--background` token.
  *
- * The alpha is 0: the card writes 1, so the scene target's alpha is its
- * coverage and `present.wgsl` knows where the floor reflection may show.
+ * The card writes premultiplied colour with its coverage in alpha, so the
+ * composite lays it over this.
  */
-const BACKGROUND: readonly [number, number, number, number] = [0, 0, 0, 0];
+const BACKGROUND: readonly [number, number, number] = [0, 0, 0];
 
-/** Blur radius of the floor reflection at the bottom of the frame, in uv. */
-const REFLECTION_BLUR = 0.01;
-
-/** Clear value of the reflection target: nothing, not even an alpha. */
+/** Clear value of the card target: nothing at all, not even an alpha. */
 const TRANSPARENT: readonly [number, number, number, number] = [0, 0, 0, 0];
+
+/**
+ * Outline colour for the width probe.
+ *
+ * The delivered frames draw a black line on a black background, which cannot be
+ * measured from the outside. A pure red line can: the card is near-neutral, so
+ * `red - green` recovers the line's own coverage over both the background and
+ * the card, and summing it across a silhouette crossing gives a sub-pixel
+ * width.
+ */
+const PROBE_OUTLINE: readonly [number, number, number] = [1, 0, 0];
 
 /** Which frames to shoot. */
 type ViewName = "hero" | "edge" | "back";
@@ -80,6 +96,7 @@ const VIEW_NAMES: readonly ViewName[] = ["hero", "edge", "back"];
 
 interface Args {
   readonly preset: PresetName;
+  readonly fx: CardFx;
   readonly out: string;
   readonly width: number;
   readonly height: number;
@@ -94,23 +111,37 @@ interface Args {
    * probe is unchanged.
    */
   readonly pointer?: readonly [number, number];
-  /** `--pitch <degrees>` overrides the hero pitch. */
-  readonly pitch?: number;
+  /** `--yaw <degrees>` overrides the hero yaw, for a steep three-quarter view. */
+  readonly yaw?: number;
+  /** `--dpr <n>` scales the outline, as a device pixel ratio would. */
+  readonly dpr: number;
+  /** `--splats <n>` thins the cloud, for slow software adapters. */
+  readonly splats: number;
+  /** `--probe` keeps the red-outline frame the width probe measures. */
+  readonly probe: boolean;
 }
 
 function parseArgs(argv: readonly string[]): Args {
   const values = new Map<string, string>();
   let all = false;
+  let probe = false;
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === "--all") {
       all = true;
+    } else if (token === "--probe") {
+      probe = true;
     } else if (token.startsWith("--")) {
       values.set(token.slice(2), argv[i + 1] ?? "");
       i += 1;
     }
   }
   const preset = resolvePreset(values.get("preset"));
+  const fxArg = values.get("fx");
+  if (fxArg !== undefined && !FX_NAMES.includes(fxArg as CardFx)) {
+    throw new Error(`--fx wants one of ${FX_NAMES.join(", ")}, got "${fxArg}"`);
+  }
+  const fx = resolveFx(fxArg);
   const view = values.get("view");
   const views =
     view && VIEW_NAMES.includes(view as ViewName)
@@ -128,9 +159,10 @@ function parseArgs(argv: readonly string[]): Args {
       `--pointer wants "x,y" as viewport fractions, got "${pointerArg}"`
     );
   }
-  const pitchArg = values.get("pitch");
+  const yawArg = values.get("yaw");
   return {
     preset,
+    fx,
     out: values.get("out") ?? `renders/${preset}.png`,
     width: Number(values.get("width") ?? 1600),
     height: Number(values.get("height") ?? 1000),
@@ -138,7 +170,10 @@ function parseArgs(argv: readonly string[]): Args {
     views,
     explicitOut: values.has("out"),
     pointer,
-    pitch: pitchArg ? (Number(pitchArg) * Math.PI) / 180 : undefined,
+    yaw: yawArg ? (Number(yawArg) * Math.PI) / 180 : undefined,
+    dpr: Number(values.get("dpr") ?? 1),
+    splats: Number(values.get("splats") ?? SPLAT_COUNT),
+    probe,
   };
 }
 
@@ -422,78 +457,152 @@ function probeFace(
   };
 }
 
-/** Top edge of the mirrored card, in millimetres. */
-const REFLECTION_TOP = 2 * CARD_FLOOR_Y + CARD_HEIGHT / 2;
-
-interface ReflectionProbe {
-  /** Mean luminance over the whole reflection band. */
-  readonly mean: number;
-  /** Mean luminance of five equal rows, top to bottom. */
-  readonly rows: readonly number[];
-  /** True when every row is at most as bright as the one above it. */
-  readonly fading: boolean;
+/**
+ * Mean luminance of the band under the card, where the floor reflection used to
+ * be drawn. Nothing renders there now, so it must read as background.
+ */
+function underCardLuminance(
+  pixels: Uint8Array,
+  width: number,
+  height: number
+): number {
+  const bounds = silhouette(pixels, width, height);
+  const y0 = Math.min(height - 1, bounds.maxY + 6);
+  if (bounds.maxX <= bounds.minX || y0 >= height - 1) return 0;
+  let total = 0;
+  let count = 0;
+  for (let y = y0; y < height; y += 1) {
+    for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
+      total += luminance(pixels, (y * width + x) * 4);
+      count += 1;
+    }
+  }
+  return count > 0 ? total / count : 0;
 }
 
 /**
- * Reads the floor reflection: the band under the mirrored card's top edge,
- * inside its horizontal extent, split into five rows.
+ * Four points on the card's silhouette, in model millimetres, each with the
+ * direction the outline runs in there.
  *
- * A real reflection gets dimmer with depth, so the rows must decrease.
+ * They sit at mid-thickness on the middle of each side, which is on the
+ * silhouette of an extruded rounded rectangle from any viewing angle.
  */
-function probeReflection(
+const OUTLINE_SAMPLES: readonly {
+  readonly name: string;
+  readonly point: readonly [number, number, number];
+  readonly along: readonly [number, number, number];
+}[] = [
+  { name: "left", point: [-CARD_WIDTH / 2, 0, 0], along: [0, 1, 0] },
+  { name: "right", point: [CARD_WIDTH / 2, 0, 0], along: [0, 1, 0] },
+  { name: "top", point: [0, CARD_HEIGHT / 2, 0], along: [1, 0, 0] },
+  { name: "bottom", point: [0, -CARD_HEIGHT / 2, 0], along: [1, 0, 0] },
+];
+
+/** Bilinear read of the outline's own coverage at a fractional pixel. */
+function outlineCoverage(
   pixels: Uint8Array,
   width: number,
   height: number,
-  viewProjection: Float32Array
-): ReflectionProbe {
-  const inset = 10;
-  const left = project(
-    viewProjection,
-    [-CARD_WIDTH / 2 + inset, REFLECTION_TOP, 0],
-    width,
-    height
+  x: number,
+  y: number
+): number {
+  const at = (px: number, py: number): number => {
+    const cx = Math.min(width - 1, Math.max(0, px));
+    const cy = Math.min(height - 1, Math.max(0, py));
+    const index = (cy * width + cx) * 4;
+    // The probe frame draws the line in pure red over a near-neutral card, so
+    // red minus green is the line's own coverage, on the card and off it.
+    return Math.min(1, Math.max(0, (pixels[index] - pixels[index + 1]) / 255));
+  };
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const fx = x - x0;
+  const fy = y - y0;
+  return (
+    at(x0, y0) * (1 - fx) * (1 - fy) +
+    at(x0 + 1, y0) * fx * (1 - fy) +
+    at(x0, y0 + 1) * (1 - fx) * fy +
+    at(x0 + 1, y0 + 1) * fx * fy
   );
-  const right = project(
-    viewProjection,
-    [CARD_WIDTH / 2 - inset, REFLECTION_TOP, 0],
-    width,
-    height
-  );
-  const top = project(viewProjection, [0, REFLECTION_TOP, 0], width, height);
+}
 
-  const x0 = Math.max(0, Math.round(Math.min(left.x, right.x)));
-  const x1 = Math.min(width - 1, Math.round(Math.max(left.x, right.x)));
-  // A few pixels of slack so the mirrored card's own antialiased edge is out.
-  const y0 = Math.max(0, Math.round(Math.max(top.y, left.y, right.y)) + 4);
-  const y1 = height - 1;
-  if (x1 <= x0 || y1 - y0 < 5) {
-    return { mean: 0, rows: [], fading: false };
-  }
+/**
+ * Outline width at each of {@link OUTLINE_SAMPLES}, in pixels.
+ *
+ * The line is measured across itself rather than along a screen axis: the
+ * outline's screen direction comes from projecting a second point a little way
+ * along the same side, and the integration walks the perpendicular. A scan down
+ * a column would read a slanted edge as `width / cos(angle)` and make a
+ * constant-width line look like it changed with the card's angle, which is the
+ * one thing this probe exists to rule out.
+ *
+ * The band is found in the pixels rather than assumed to sit on the projected
+ * point: a mid-thickness sample point is a pixel or two off the silhouette the
+ * rasteriser actually drew, because the silhouette is formed by whichever face
+ * of the 0.76 mm slab is turned towards the camera. So the walk starts at the
+ * strongest coverage near the sample and runs out to where the line ends.
+ */
+function outlineProbe(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  viewProjection: Float32Array,
+  model: Float32Array,
+  outlineWidth: number
+): { name: string; width: number }[] {
+  const SEARCH = 8;
+  const STEP = 0.1;
+  const FLOOR = 0.03;
+  // Far enough to hold the whole line, near enough to leave out a face-versus-
+  // rim crease line that has separated from it.
+  const reach = outlineWidth;
+  return OUTLINE_SAMPLES.map(({ name, point, along }) => {
+    const here = project(
+      viewProjection,
+      transformPoint(model, point),
+      width,
+      height
+    );
+    const ahead = project(
+      viewProjection,
+      transformPoint(model, [
+        point[0] + along[0] * 4,
+        point[1] + along[1] * 4,
+        point[2] + along[2] * 4,
+      ]),
+      width,
+      height
+    );
+    const dx = ahead.x - here.x;
+    const dy = ahead.y - here.y;
+    const length = Math.hypot(dx, dy) || 1;
+    // The perpendicular to the outline's screen direction.
+    const nx = -dy / length;
+    const ny = dx / length;
+    const at = (t: number): number =>
+      outlineCoverage(pixels, width, height, here.x + nx * t, here.y + ny * t);
 
-  const bands = 5;
-  const rows: number[] = [];
-  let total = 0;
-  let count = 0;
-  for (let band = 0; band < bands; band += 1) {
-    const from = y0 + Math.round(((y1 - y0) * band) / bands);
-    const to = y0 + Math.round(((y1 - y0) * (band + 1)) / bands);
-    let bandTotal = 0;
-    let bandCount = 0;
-    for (let y = from; y < to; y += 1) {
-      for (let x = x0; x <= x1; x += 1) {
-        bandTotal += luminance(pixels, (y * width + x) * 4);
-        bandCount += 1;
+    // The line's crest, which is where the silhouette really landed.
+    let crest = 0;
+    let best = -1;
+    for (let t = -SEARCH; t <= SEARCH; t += STEP) {
+      const value = at(t);
+      if (value > best + 1e-6) {
+        best = value;
+        crest = t;
       }
     }
-    rows.push(bandCount > 0 ? bandTotal / bandCount : 0);
-    total += bandTotal;
-    count += bandCount;
-  }
 
-  const fading = rows.every(
-    (value, index) => index === 0 || value <= rows[index - 1] + 0.002
-  );
-  return { mean: count > 0 ? total / count : 0, rows, fading };
+    let total = best * STEP;
+    for (const direction of [1, -1]) {
+      for (let step = 1; step * STEP <= reach; step += 1) {
+        const value = at(crest + direction * step * STEP);
+        if (value < FLOOR) break;
+        total += value * STEP;
+      }
+    }
+    return { name, width: total };
+  });
 }
 
 interface ShotOptions {
@@ -506,8 +615,8 @@ interface ShotOptions {
   readonly tilt?: number;
   /** Cursor position as a viewport fraction; omitted leaves the lamp off. */
   readonly pointer?: readonly [number, number];
-  /** Renders the mirrored floor pass. Off for the geometry-only frames. */
-  readonly reflection?: boolean;
+  /** Draws the outline in red so its width can be measured from the pixels. */
+  readonly probeOutline?: boolean;
 }
 
 /** Applies a column-major 4x4 matrix to a point. */
@@ -530,6 +639,9 @@ async function main(): Promise<void> {
   const cardShader = await resolveShader({
     entry: `${ROOT}shaders/card.wgsl`,
   });
+  const splatShader = await resolveShader({
+    entry: `${ROOT}shaders/splat.wgsl`,
+  });
   const presentShader = await resolveShader({
     entry: `${ROOT}shaders/present.wgsl`,
   });
@@ -538,25 +650,48 @@ async function main(): Promise<void> {
   const gpu = await init();
   const api: VgpuApi = { draw, geometry, sampler, texture };
 
-  const { width, height } = args;
+  const { width, height, fx, dpr } = args;
   const aspect = width / height;
-  const scene = target(gpu, { size: [width, height], depth: true });
-  // The floor reflection is drawn at half resolution; the composite blurs it.
-  const reflection = target(gpu, {
-    size: [Math.max(1, width >> 1), Math.max(1, height >> 1)],
+  // Two attachments: the premultiplied picture, and the packed world normal
+  // plus silhouette mask the composite's outline reads. Multisampled, because a
+  // three pixel line dilated from a jagged silhouette is a jagged line, and
+  // `rgba8unorm` because compatibility mode will not multisample a float
+  // format.
+  const scene = target(gpu, {
+    size: [width, height],
+    colors: [{ format: "rgba8unorm" }, { format: "rgba8unorm" }],
     depth: true,
+    msaa: true,
   });
   const output = target(gpu, { size: [width, height] });
+
+  const composite = (probeOutline: boolean) => ({
+    background: [...BACKGROUND] as [number, number, number],
+    outlineWidth: OUTLINE_PX * dpr,
+    outlineColor: [...(probeOutline ? PROBE_OUTLINE : OUTLINE_COLOR)] as [
+      number,
+      number,
+      number,
+    ],
+    dpr,
+    size: [width, height] as [number, number],
+    tick: 0,
+    mode: fxMode(fx),
+  });
+
   const present = effect(gpu, presentShader.wgsl, {
     set: {
-      scene,
-      sceneSampler: sampler(gpu, { minFilter: "linear", magFilter: "linear" }),
-      reflection,
-      composite: { floorLine: 1, blur: REFLECTION_BLUR },
+      scene: scene.colors[0],
+      normalMask: scene.colors[1],
+      composite: composite(false),
     },
   });
 
   const presets = args.all ? PRESET_NAMES : [args.preset];
+  const splatting = fx === "splat";
+
+  /** Milliseconds the last `shoot()` spent inside the frame. */
+  let lastFrameMs = 0;
 
   const shoot = (
     card: ReturnType<typeof createCardScene>,
@@ -584,42 +719,43 @@ async function main(): Promise<void> {
       shot.pointer ? 1 : 0
     );
     card.sync();
-    present.set({
-      composite: { floorLine: card.floorLine(), blur: REFLECTION_BLUR },
-    });
+    present.set({ composite: composite(shot.probeOutline ?? false) });
+    const started = performance.now();
     frame(gpu, (current) => {
+      // One pass: an MSAA target discards its multisample attachments at the
+      // end of a pass, so the splats have to ride along with the card.
       current.pass(
-        { target: reflection, clear: TRANSPARENT, clearDepth: 1 },
-        (pass) => {
-          if (shot.reflection) pass.draw(card.reflectionDraw);
-        }
-      );
-      current.pass(
-        { target: scene, clear: BACKGROUND, clearDepth: 1 },
+        { target: scene, clear: TRANSPARENT, clearDepth: 1 },
         (pass) => {
           pass.draw(card.draw);
+          if (splatting) pass.draw(card.splatDraw);
         }
       );
       current.pass(output, present);
     });
-    return output.color
-      .read({ mipLevel: 0, region: "all" })
-      .then((buffer) => new Uint8Array(buffer));
+    return output.color.read({ mipLevel: 0, region: "all" }).then((buffer) => {
+      lastFrameMs = performance.now() - started;
+      return new Uint8Array(buffer);
+    });
   };
 
   for (const preset of presets) {
     const card = createCardScene(api, gpu, {
       shader: cardShader.wgsl,
+      splatShader: splatShader.wgsl,
       preset,
+      fx,
       designs,
       aspect,
+      splatCount: args.splats,
     });
 
     const base = (args.all ? `renders/${preset}.png` : args.out).replace(
       /\.png$/,
       ""
     );
-    const report: string[] = [`preset=${preset}`];
+    const report: string[] = [`preset=${preset}`, `fx=${fx}`, `dpr=${dpr}`];
+    if (splatting) report.push(`splats=${card.splatCount}`);
     const wanted = new Set(args.views);
     // A single view only takes the bare `--out` path when the caller named one,
     // so `--view edge` on its own can never overwrite the hero frame.
@@ -628,15 +764,15 @@ async function main(): Promise<void> {
     if (wanted.has("hero")) {
       const path = `${base}.png`;
       const heroShot: ShotOptions = {
-        yaw: CARD_HERO_YAW,
-        pitch: args.pitch ?? CARD_HERO_PITCH,
+        yaw: args.yaw ?? CARD_HERO_YAW,
+        pitch: CARD_HERO_PITCH,
         distance: cardCameraDistance(aspect),
         sway: 0,
-        reflection: true,
       };
       const hero = await shoot(card, { ...heroShot, pointer: args.pointer });
       const heroViewProjection = new Float32Array(card.camera.viewProjection);
       writePng(path, hero, width, height);
+      report.push(`frame_ms=${lastFrameMs.toFixed(1)}`);
 
       const probe = probeFace(
         hero,
@@ -655,11 +791,27 @@ async function main(): Promise<void> {
         `probe_samples=${probe.samples}`
       );
 
-      const mirror = probeReflection(hero, width, height, heroViewProjection);
       report.push(
-        `reflection_mean=${mirror.mean.toFixed(4)}`,
-        `reflection_rows=${mirror.rows.map((row) => row.toFixed(4)).join("/")}`,
-        `reflection_fading=${mirror.fading}`
+        `under_card=${underCardLuminance(hero, width, height).toFixed(5)}`
+      );
+
+      // The line is black on black in the delivered frame, so the width is
+      // measured on the same camera with a red line.
+      const marked = await shoot(card, { ...heroShot, probeOutline: true });
+      if (args.probe) writePng(`${base}-probe.png`, marked, width, height);
+      const widths = outlineProbe(
+        marked,
+        width,
+        height,
+        heroViewProjection,
+        new Float32Array(card.model.worldMatrix),
+        OUTLINE_PX * dpr
+      );
+      report.push(
+        `outline_px=${(OUTLINE_PX * dpr).toFixed(1)}`,
+        `outline_widths=${widths
+          .map((entry) => `${entry.name}:${entry.width.toFixed(2)}`)
+          .join("/")}`
       );
 
       // The cursor light is compared against the same frame without it, at the
@@ -724,13 +876,14 @@ async function main(): Promise<void> {
       // camera climbs above it, so the frame holds the lit back face and, along
       // its top, the 0.76 mm wall catching the key.
       const EDGE_TILT = (72 * Math.PI) / 180;
-      const edge = await shoot(card, {
+      const edgeShot: ShotOptions = {
         yaw: 0.16,
         pitch: 0.38,
         distance: 66,
         sway: 0,
         tilt: EDGE_TILT,
-      });
+      };
+      const edge = await shoot(card, edgeShot);
       const edgeViewProjection = new Float32Array(card.camera.viewProjection);
       const edgeModel = new Float32Array(card.model.worldMatrix);
       writePng(path, edge, width, height);

@@ -1,4 +1,4 @@
-import type { Draw, Gpu, ShaderSource, Texture } from "vgpu";
+import type { Draw, Geometry, Gpu, ShaderSource, Texture } from "vgpu";
 import {
   group,
   perspectiveCamera,
@@ -6,8 +6,16 @@ import {
   type SceneNode,
 } from "vgpu/scene";
 
+import {
+  SPLAT_COUNT,
+  SPLAT_LIFT,
+  SPLAT_SIZE,
+  solidMix,
+  type CardFx,
+} from "@/lib/card-fx";
 import { cardGeometryOptions } from "@/lib/card-geometry";
 import { cardMaterial, type PresetName } from "@/lib/card-presets";
+import { splatGeometryOptions } from "@/lib/card-splats";
 import {
   CARD_HEIGHT,
   CARD_WIDTH,
@@ -45,23 +53,6 @@ export const CARD_HERO_PITCH = (8 * Math.PI) / 180;
 /** Idle spin speed in radians per second: one full turn every 16 seconds. */
 const SPIN_SPEED = (2 * Math.PI) / 16;
 
-/** Gap between the card's bottom edge and the invisible floor, in millimetres. */
-export const CARD_FLOAT_HEIGHT = 6;
-
-/** The plane the floor reflection is mirrored about, in millimetres. */
-export const CARD_FLOOR_Y = -(CARD_HEIGHT / 2 + CARD_FLOAT_HEIGHT);
-
-/** Global gain of the floor reflection. */
-const REFLECTION_STRENGTH = 0.35;
-
-/**
- * Distance below the floor line over which the reflection dies, in millimetres.
- *
- * The mirrored card starts {@link CARD_FLOAT_HEIGHT} below the line, so it
- * never gets the full strength; by the bottom of a hero frame it is gone.
- */
-const REFLECTION_FADE = 34;
-
 /**
  * How far in front of the card the cursor light hangs, in millimetres.
  *
@@ -75,9 +66,14 @@ export type ScenePoint = readonly [number, number, number];
 
 export interface CardSceneOptions {
   readonly shader: string | ShaderSource;
+  /** `shaders/splat.wgsl`, for the `fx=splat` point cloud. */
+  readonly splatShader: string | ShaderSource;
   readonly preset: PresetName;
+  readonly fx: CardFx;
   readonly designs: Record<CardSide, Uint8Array>;
   readonly aspect: number;
+  /** Splats in the cloud; the render script lowers it on slow adapters. */
+  readonly splatCount?: number;
   /** Initial orbit pose, the hero three-quarter view by default. */
   readonly yaw?: number;
   readonly pitch?: number;
@@ -104,16 +100,21 @@ function clamp01(value: number): number {
 
 export interface CardScene {
   readonly draw: Draw;
-  /** The same card mirrored about the floor plane, for the reflection pass. */
-  readonly reflectionDraw: Draw;
+  /** The point cloud, drawn over the solid card when `fx=splat`. */
+  readonly splatDraw: Draw;
+  readonly splatCount: number;
   readonly camera: PerspectiveCamera;
   readonly model: SceneNode;
   /** Advances the idle spin; `amount` fades it out while the user is dragging. */
   animate(time: number, amount: number): void;
-  /** Uploads camera, model and pointer state for the current frame. */
+  /** Uploads camera, model, pointer and splat state for the current frame. */
   sync(): void;
   setAspect(aspect: number): void;
   setPreset(preset: PresetName): void;
+  /** Switches the grain variant, which is what dims the solid card. */
+  setFx(fx: CardFx): void;
+  /** Advances the splat twinkle. One tick every few frames, not every frame. */
+  setTick(tick: number): void;
   /** Moves the cursor light; `intensity` 0 switches it off entirely. */
   setPointer(position: ScenePoint, intensity: number): void;
   /**
@@ -121,17 +122,17 @@ export interface CardScene {
    * cursor light's plane, in scene millimetres.
    */
   pointerPlanePoint(ndcX: number, ndcY: number): ScenePoint;
-  /** Texture-space v of the floor line, which `present.wgsl` blurs around. */
-  floorLine(): number;
   destroy(): void;
 }
 
 /**
- * Builds the single draw that renders the card.
+ * Builds the draws that render the card.
  *
  * vgpu 0.5.0 has no scene renderer, so this is the low-level path: a custom
  * geometry with named attributes plus our own vertex and fragment stages, with
- * `perspectiveCamera` only supplying the view-projection matrix.
+ * `perspectiveCamera` only supplying the view-projection matrix. The card pass
+ * writes two colour attachments, the picture and the outline's geometry buffer,
+ * and the splat pass blends over it without touching the second one.
  */
 export function createCardScene(
   api: VgpuApi,
@@ -139,6 +140,11 @@ export function createCardScene(
   options: CardSceneOptions
 ): CardScene {
   const geometry = api.geometry(gpu, cardGeometryOptions());
+  const splatCount = options.splatCount ?? SPLAT_COUNT;
+  const splatGeometry: Geometry = api.geometry(
+    gpu,
+    splatGeometryOptions(splatCount)
+  );
 
   const designSampler = api.sampler(gpu, {
     magFilter: "linear",
@@ -150,6 +156,7 @@ export function createCardScene(
   });
 
   let aspect = options.aspect;
+  let fx = options.fx;
 
   const textures: Texture[] = [];
   const design = (side: CardSide, label: string): Texture => {
@@ -184,14 +191,32 @@ export function createCardScene(
     intensity: 0,
   };
 
-  // The mirror image of `model.worldMatrix`, rebuilt every `sync()`.
-  const mirrorMatrix = new Float32Array(16);
+  const splat = { size: SPLAT_SIZE, tick: 0, lift: SPLAT_LIFT };
 
   const shared = {
     material: cardMaterial(options.preset),
     frontDesign,
     backDesign,
     designSampler,
+  };
+
+  const cameraValue = () => ({
+    viewProjection: camera.viewProjection,
+    position: camera.worldPosition,
+  });
+
+  /**
+   * The camera basis in world space, which the splat pass needs to face its
+   * quads at the viewer. The view matrix maps world to camera space, so the
+   * rows of its rotation block are exactly that basis.
+   */
+  const splatCameraValue = () => {
+    const view = camera.view;
+    return {
+      ...cameraValue(),
+      right: [view[0], view[4], view[8]] as [number, number, number],
+      up: [view[1], view[5], view[9]] as [number, number, number],
+    };
   };
 
   const draw = api.draw(gpu, {
@@ -201,57 +226,39 @@ export function createCardScene(
     cull: "back",
     depth: { write: true, compare: "less-equal" },
     set: {
-      camera: {
-        viewProjection: camera.viewProjection,
-        position: camera.worldPosition,
-      },
+      camera: cameraValue(),
       model: { matrix: model.worldMatrix },
       ...shared,
       pointer,
-      reflection: {
-        floorY: CARD_FLOOR_Y,
-        fade: REFLECTION_FADE,
-        strength: REFLECTION_STRENGTH,
-        isReflection: 0,
-      },
+      style: { solidMix: solidMix(fx) },
     },
   });
 
-  // The floor reflection is the same card under a mirrored model matrix. A
-  // mirror flips the winding, so clockwise triangles are the front ones here.
-  const reflectionDraw = api.draw(gpu, {
-    label: "card-reflection",
-    shader: options.shader,
-    geometry,
-    cull: "back",
-    frontFace: "cw",
-    depth: { write: true, compare: "less-equal" },
+  // The cloud is premultiplied over the solid card and never writes depth: the
+  // quads overlap each other, and sorting a hundred thousand of them per frame
+  // is not what this is for.
+  //
+  // It also has to leave the outline's geometry buffer alone, so the line keeps
+  // reading the solid card's own silhouette and crease. A per-attachment write
+  // mask would be the obvious way to say that, but WebGPU compatibility mode
+  // requires every colour target to share one blend state and one write mask.
+  // Instead the shader writes a fully transparent black to that attachment, and
+  // premultiplied blending leaves the destination exactly as it found it.
+  const splatDraw = api.draw(gpu, {
+    label: "card-splats",
+    shader: options.splatShader,
+    geometry: splatGeometry,
+    cull: "none",
+    blend: "premultiplied",
+    depth: { write: false, compare: "less-equal" },
     set: {
-      camera: {
-        viewProjection: camera.viewProjection,
-        position: camera.worldPosition,
-      },
-      model: { matrix: mirrorMatrix },
+      camera: splatCameraValue(),
+      model: { matrix: model.worldMatrix },
       ...shared,
       pointer,
-      reflection: {
-        floorY: CARD_FLOOR_Y,
-        fade: REFLECTION_FADE,
-        strength: REFLECTION_STRENGTH,
-        isReflection: 1,
-      },
+      splat,
     },
   });
-
-  /** Mirrors a rigid model matrix about `y = CARD_FLOOR_Y`, in place. */
-  const mirrorAboutFloor = (source: Float32Array): Float32Array => {
-    mirrorMatrix.set(source);
-    for (let column = 0; column < 4; column += 1) {
-      mirrorMatrix[column * 4 + 1] = -source[column * 4 + 1];
-    }
-    mirrorMatrix[13] += 2 * CARD_FLOOR_Y;
-    return mirrorMatrix;
-  };
 
   const placeCamera = (): void => {
     const distance = cardCameraDistance(aspect);
@@ -275,7 +282,8 @@ export function createCardScene(
 
   return {
     draw,
-    reflectionDraw,
+    splatDraw,
+    splatCount,
     camera,
     model,
     animate(time: number, amount: number): void {
@@ -285,17 +293,13 @@ export function createCardScene(
       model.set({ rotation: [0, spinYaw, 0] });
     },
     sync(): void {
-      const view = {
-        camera: {
-          viewProjection: camera.viewProjection,
-          position: camera.worldPosition,
-        },
+      const matrix = { matrix: model.worldMatrix };
+      draw.set({ camera: cameraValue(), model: matrix, pointer });
+      splatDraw.set({
+        camera: splatCameraValue(),
+        model: matrix,
         pointer,
-      };
-      draw.set({ ...view, model: { matrix: model.worldMatrix } });
-      reflectionDraw.set({
-        ...view,
-        model: { matrix: mirrorAboutFloor(model.worldMatrix as Float32Array) },
+        splat,
       });
     },
     setAspect(next: number): void {
@@ -305,7 +309,14 @@ export function createCardScene(
     setPreset(preset: PresetName): void {
       const material = cardMaterial(preset);
       draw.set({ material });
-      reflectionDraw.set({ material });
+      splatDraw.set({ material });
+    },
+    setFx(next: CardFx): void {
+      fx = next;
+      draw.set({ style: { solidMix: solidMix(fx) } });
+    },
+    setTick(tick: number): void {
+      splat.tick = tick;
     },
     setPointer(position: ScenePoint, intensity: number): void {
       pointer.position[0] = position[0];
@@ -336,15 +347,9 @@ export function createCardScene(
         eye[2] - view[10] * depth + view[8] * x + view[9] * y,
       ];
     },
-    floorLine(): number {
-      const m = camera.viewProjection;
-      const clipY = m[5] * CARD_FLOOR_Y + m[13];
-      const clipW = m[7] * CARD_FLOOR_Y + m[15];
-      if (clipW === 0) return 1;
-      return 1 - ((clipY / clipW) * 0.5 + 0.5);
-    },
     destroy(): void {
       geometry.destroy();
+      splatGeometry.destroy();
       for (const item of textures) item.destroy();
     },
   };

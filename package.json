@@ -10,7 +10,7 @@
     "format": "prettier --write .",
     "fonts": "bun run scripts/fetch-fonts.ts",
     "render": "bun run scripts/render.ts --all",
-    "check:wgsl": "vgpu check shaders/card.wgsl --require-validation && vgpu check shaders/present.wgsl --require-validation"
+    "check:wgsl": "vgpu check shaders/card.wgsl --require-validation && vgpu check shaders/splat.wgsl --require-validation && vgpu check shaders/present.wgsl --require-validation"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",

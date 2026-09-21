@@ -3,9 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { startCard } from "@/lib/card-runtime";
+import type { CardFx } from "@/lib/card-fx";
 import type { PresetName } from "@/lib/card-presets";
 
-export function CardCanvas({ preset }: { preset: PresetName }) {
+export function CardCanvas({ preset, fx }: { preset: PresetName; fx: CardFx }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [failed, setFailed] = useState(false);
   const [ready, setReady] = useState(false);
@@ -25,6 +26,7 @@ export function CardCanvas({ preset }: { preset: PresetName }) {
     const fallback = window.setTimeout(handleReady, 3000);
     const stop = startCard(canvas, {
       preset,
+      fx,
       onError: handleError,
       onReady: handleReady,
     });
@@ -32,7 +34,7 @@ export function CardCanvas({ preset }: { preset: PresetName }) {
       window.clearTimeout(fallback);
       stop();
     };
-  }, [preset, handleError, handleReady]);
+  }, [preset, fx, handleError, handleReady]);
 
   if (failed) {
     return <p className="text-muted-foreground text-sm">WebGPU required</p>;
