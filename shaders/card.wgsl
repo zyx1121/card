@@ -10,6 +10,15 @@
 // coating is sandblasted and micro-brushed along the card's long axis, so the
 // specular lobe is anisotropic and the environment lookup is stretched along
 // the tangent to match.
+//
+// A fourth light follows the cursor: a soft point light on a plane between the
+// camera and the card. It is off (`pointer.intensity` 0) unless the page or the
+// render script supplies a pointer.
+//
+// The same shader draws the floor reflection. That pass binds a model matrix
+// mirrored about the floor plane and sets `reflection.isReflection`, which
+// turns the fragment output into a premultiplied, downward-fading copy that
+// `present.wgsl` composites underneath the card.
 
 import { fbmPerlin2d } from "@vgpu/wgsl-std/noise/perlin";
 
@@ -17,6 +26,20 @@ const PI: f32 = 3.14159265359;
 
 const FACE_FRONT: u32 = 0u;
 const FACE_BACK: u32 = 1u;
+
+/// Falloff scale of the cursor light, in millimetres.
+const POINTER_RADIUS: f32 = 60.0;
+
+/// Warm-neutral white, a touch below daylight so the pool reads as a lamp.
+const POINTER_COLOR: vec3f = vec3f(1.0, 0.94, 0.86);
+
+/// Peak radiance of the cursor light at `intensity` 1, before falloff.
+const POINTER_GAIN: f32 = 42.0;
+
+/// How much of the cursor light the etch floor loses. The lamp is near-field
+/// and nearly head-on, so the recess walls cut it far harder than they cut the
+/// distant softboxes; without that the marks wash out under the pool.
+const POINTER_ETCH_SHADE: f32 = 0.8;
 
 struct Camera {
   viewProjection: mat4x4f,
@@ -53,12 +76,31 @@ struct Material {
   edgeRoughness: f32,
 }
 
+// The cursor light. `position` is in scene millimetres; `intensity` is eased on
+// the CPU and is 0 whenever no pointer is over the canvas.
+struct Pointer {
+  position: vec3f,
+  intensity: f32,
+}
+
+// Drives the mirrored floor pass. `floorY` is the mirror plane, `fade` the
+// distance below it over which the reflection dies, `strength` its global gain
+// and `isReflection` the flag that switches the fragment output over.
+struct Reflection {
+  floorY: f32,
+  fade: f32,
+  strength: f32,
+  isReflection: u32,
+}
+
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> model: Model;
 @group(0) @binding(2) var<uniform> material: Material;
 @group(0) @binding(3) var frontDesign: texture_2d<f32>;
 @group(0) @binding(4) var backDesign: texture_2d<f32>;
 @group(0) @binding(5) var designSampler: sampler;
+@group(0) @binding(6) var<uniform> pointer: Pointer;
+@group(0) @binding(7) var<uniform> reflection: Reflection;
 
 struct VertexOut {
   @builtin(position) position: vec4f,
@@ -513,13 +555,30 @@ fn fs_main(input: VertexOut) -> @location(0) vec4f {
     normal, view, geometricNormal, tangent, bitangent, surface, f0,
   );
 
+  // Cursor light: a soft lamp hanging between the camera and the card. The
+  // falloff is squared so the pool has a readable centre instead of lifting the
+  // whole face, and the whole term collapses to zero when no pointer is over
+  // the canvas.
+  if (pointer.intensity > 0.0) {
+    let toPointer = pointer.position - input.worldPosition;
+    let pointerDistance = max(length(toPointer), 1e-3);
+    let ratio = pointerDistance / POINTER_RADIUS;
+    let falloff = 1.0 / (1.0 + ratio * ratio);
+    color += shadeLight(
+      toPointer,
+      POINTER_COLOR * POINTER_GAIN * pointer.intensity * falloff * falloff *
+        (1.0 - coverage * POINTER_ETCH_SHADE),
+      normal, view, geometricNormal, tangent, bitangent, surface, f0,
+    );
+  }
+
   // Image based lighting from the procedural studio.
   let nDotV = max(dot(normal, view), 1e-4);
-  let reflection = reflect(-view, normal);
+  let reflectionDirection = reflect(-view, normal);
   let irradiance = studio(normal, 1.0);
   let kd = (vec3f(1.0) - fresnelSchlick(nDotV, f0)) * (1.0 - surface.metallic);
   color += kd * surface.albedo * irradiance * 0.32 * etchAo;
-  color += environment(reflection, surface.roughness, tangent, surface.anisotropy) *
+  color += environment(reflectionDirection, surface.roughness, tangent, surface.anisotropy) *
     envBrdfApprox(f0, surface.roughness, nDotV) * etchAo;
 
   if (surface.clearcoat > 0.0) {
@@ -529,5 +588,17 @@ fn fs_main(input: VertexOut) -> @location(0) vec4f {
     color += studio(ccReflection, max(surface.clearcoatRoughness, 0.02)) * ccFresnel;
   }
 
-  return vec4f(linearToSrgb(tonemap(color * material.exposure)), 1.0);
+  let shaded = linearToSrgb(tonemap(color * material.exposure));
+
+  if (reflection.isReflection == 0u) {
+    return vec4f(shaded, 1.0);
+  }
+
+  // Mirrored pass: the copy dies quadratically with the distance below the
+  // floor line, and is written premultiplied so `present.wgsl` can blur it
+  // without dragging the cleared background into its edges.
+  let below = max(reflection.floorY - input.worldPosition.y, 0.0);
+  let near = clamp(1.0 - below / max(reflection.fade, 1e-3), 0.0, 1.0);
+  let fade = near * near * reflection.strength;
+  return vec4f(shaded * fade, fade);
 }

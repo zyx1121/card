@@ -33,6 +33,34 @@ const PITCH_RETURN_RATE = 2.5;
 
 const MAX_PITCH = (80 * Math.PI) / 180;
 
+/** Length of the one-shot intro move, in seconds. */
+const INTRO_DURATION = 1.6;
+
+/** Where the intro starts: edge-on, above the card and further out. */
+const INTRO_YAW = (-110 * Math.PI) / 180;
+const INTRO_PITCH = (20 * Math.PI) / 180;
+const INTRO_DISTANCE_SCALE = 1.8;
+
+/** Easing time constant of the cursor light, in seconds. */
+const POINTER_EASE = 0.08;
+
+/** Seconds without a pointer before the cursor light fades out. */
+const POINTER_TIMEOUT = 1.5;
+
+/** Blur radius of the floor reflection at the bottom of the frame, in uv. */
+const REFLECTION_BLUR = 0.01;
+
+/** Cubic ease-out, the intro's only curve. */
+function easeOutCubic(t: number): number {
+  const clamped = Math.min(1, Math.max(0, t));
+  return 1 - (1 - clamped) ** 3;
+}
+
+/** Half a dimension, never smaller than one texel. */
+function half(value: number): number {
+  return Math.max(1, Math.floor(value / 2));
+}
+
 /** Reads a CSS colour token as sRGB components in 0..1. */
 function readCssColor(
   element: HTMLElement,
@@ -61,13 +89,17 @@ export interface CardRuntimeOptions {
   readonly preset: PresetName;
   /** Reports fatal startup problems, typically missing WebGPU support. */
   readonly onError?: (error: unknown) => void;
+  /** Fires once the first frame has been submitted, so the canvas can fade in. */
+  readonly onReady?: () => void;
 }
 
 /**
  * Starts the card renderer on `canvas` and returns its teardown function.
  *
  * 3D needs a depth attachment and a canvas surface has none, so the card is
- * drawn into an offscreen target and composited in a second pass.
+ * drawn into an offscreen target and composited in a second pass. A third
+ * target, at half resolution, holds the card mirrored about the floor plane;
+ * the composite blurs it and lays it under the card.
  */
 export function startCard(
   canvas: HTMLCanvasElement,
@@ -93,11 +125,21 @@ export function startCard(
         clearColor: background,
       });
       const [initialWidth, initialHeight] = canvasSurface.size;
+      // The scene clears to a transparent background, so its alpha is the
+      // card's coverage and the composite knows where the reflection may show.
+      const sceneClear = (color: readonly number[]) =>
+        [color[0], color[1], color[2], 0] as [number, number, number, number];
       const scene = target(gpu, {
         size: [initialWidth, initialHeight],
         depth: true,
-        clearColor: background,
+        clearColor: sceneClear(background),
         label: "card-scene",
+      });
+      const reflection = target(gpu, {
+        size: [half(initialWidth), half(initialHeight)],
+        depth: true,
+        clearColor: [0, 0, 0, 0],
+        label: "card-reflection",
       });
 
       const api: VgpuApi = { draw, geometry, sampler, texture };
@@ -116,6 +158,8 @@ export function startCard(
             minFilter: "linear",
             magFilter: "linear",
           }),
+          reflection,
+          composite: { floorLine: card.floorLine(), blur: REFLECTION_BLUR },
         },
       });
 
@@ -131,34 +175,71 @@ export function startCard(
 
       // The spin stops while the pointer is down and resumes RESUME_DELAY
       // seconds after release; the camera pitch eases back to its home value.
+      const homeYaw = controls.yaw;
       const homePitch = controls.pitch;
       let pointerDown = false;
       let sinceRelease = RESUME_DELAY;
-      const onPointerDown = () => {
-        pointerDown = true;
+
+      // The intro runs once per load and is skipped the moment the visitor
+      // touches the canvas.
+      let introElapsed = 0;
+      let introDone = false;
+      const endIntro = () => {
+        introDone = true;
+        controls.set({ yaw: homeYaw, pitch: homePitch, distance });
       };
-      const onPointerUp = () => {
+
+      // Cursor light: the last pointer position in NDC, an idle timer and the
+      // eased intensity the shader actually sees.
+      let pointerNdc: [number, number] | undefined;
+      let sincePointer = POINTER_TIMEOUT;
+      let pointerIntensity = 0;
+
+      const trackPointer = (event: PointerEvent): void => {
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        pointerNdc = [
+          ((event.clientX - rect.left) / rect.width) * 2 - 1,
+          1 - ((event.clientY - rect.top) / rect.height) * 2,
+        ];
+        sincePointer = 0;
+      };
+
+      const onPointerDown = (event: PointerEvent) => {
+        pointerDown = true;
+        if (!introDone) endIntro();
+        trackPointer(event);
+      };
+      const onPointerUp = (event: PointerEvent) => {
         pointerDown = false;
         sinceRelease = 0;
+        // A touch has no hover, so the light fades as soon as the finger lifts.
+        if (event.pointerType !== "mouse") sincePointer = POINTER_TIMEOUT;
       };
       const onWheel = () => {
         sinceRelease = 0;
       };
+      const onPointerLeave = () => {
+        sincePointer = POINTER_TIMEOUT;
+      };
       canvas.addEventListener("pointerdown", onPointerDown);
+      canvas.addEventListener("pointermove", trackPointer);
+      canvas.addEventListener("pointerleave", onPointerLeave);
       window.addEventListener("pointerup", onPointerUp);
       window.addEventListener("pointercancel", onPointerUp);
       canvas.addEventListener("wheel", onWheel, { passive: true });
 
       const unsubscribeResize = canvasSurface.onResize((event) => {
         scene.resize([event.width, event.height]);
-        present.set({ scene });
+        reflection.resize([half(event.width), half(event.height)]);
+        present.set({ scene, reflection });
         card.setAspect(event.width / event.height);
       });
 
       const applyTheme = () => {
         const color = readCssColor(document.body, "--background");
         canvasSurface.clearColor = color;
-        scene.clearColor = color;
+        scene.clearColor = sceneClear(color);
       };
       const observer = new MutationObserver(applyTheme);
       observer.observe(document.documentElement, {
@@ -168,9 +249,21 @@ export function startCard(
       stopThemeWatch = () => observer.disconnect();
 
       const time = clock(gpu);
+      let ready = false;
       loop = frameLoop(gpu, (frame) => {
         const delta = time.deltaTime;
-        if (!pointerDown) {
+
+        if (!introDone) {
+          introElapsed += delta;
+          const eased = easeOutCubic(introElapsed / INTRO_DURATION);
+          const from = distance * INTRO_DISTANCE_SCALE;
+          controls.set({
+            yaw: INTRO_YAW + (homeYaw - INTRO_YAW) * eased,
+            pitch: INTRO_PITCH + (homePitch - INTRO_PITCH) * eased,
+            distance: from + (distance - from) * eased,
+          });
+          if (introElapsed >= INTRO_DURATION) introDone = true;
+        } else if (!pointerDown) {
           sinceRelease += delta;
           const pitchError = homePitch - controls.pitch;
           if (Math.abs(pitchError) > 1e-4) {
@@ -183,18 +276,50 @@ export function startCard(
         }
         controls.update(delta);
 
-        const spinning = !pointerDown && sinceRelease >= RESUME_DELAY;
+        // The cursor light glides rather than snaps, and dies out once the
+        // pointer has been gone for POINTER_TIMEOUT.
+        sincePointer += delta;
+        const wanted = pointerNdc && sincePointer < POINTER_TIMEOUT ? 1 : 0;
+        pointerIntensity +=
+          (wanted - pointerIntensity) * (1 - Math.exp(-delta / POINTER_EASE));
+        if (pointerNdc && pointerIntensity > 0.001) {
+          card.setPointer(
+            card.pointerPlanePoint(pointerNdc[0], pointerNdc[1]),
+            pointerIntensity
+          );
+        } else {
+          card.setPointer([0, 0, 0], 0);
+        }
+
+        const spinning =
+          introDone && !pointerDown && sinceRelease >= RESUME_DELAY;
         card.animate(time.time, spinning ? 1 : 0);
         card.sync();
+        present.set({
+          composite: { floorLine: card.floorLine(), blur: REFLECTION_BLUR },
+        });
 
+        frame.pass(
+          { target: reflection, clear: true, clearDepth: 1 },
+          (pass) => {
+            pass.draw(card.reflectionDraw);
+          }
+        );
         frame.pass({ target: scene, clear: true, clearDepth: 1 }, (pass) => {
           pass.draw(card.draw);
         });
         frame.pass(canvasSurface, present);
+
+        if (!ready) {
+          ready = true;
+          options.onReady?.();
+        }
       });
 
       const teardown = () => {
         canvas.removeEventListener("pointerdown", onPointerDown);
+        canvas.removeEventListener("pointermove", trackPointer);
+        canvas.removeEventListener("pointerleave", onPointerLeave);
         window.removeEventListener("pointerup", onPointerUp);
         window.removeEventListener("pointercancel", onPointerUp);
         canvas.removeEventListener("wheel", onWheel);

@@ -7,6 +7,7 @@
  *
  *   bun run scripts/render.ts --preset titanium --out renders/titanium.png
  *   bun run scripts/render.ts --preset titanium --view back
+ *   bun run scripts/render.ts --view hero --pointer 0.62,0.45 --pitch 2
  *   bun run scripts/render.ts --all
  */
 
@@ -29,6 +30,7 @@ import {
 } from "vgpu/node";
 
 import {
+  CARD_FLOOR_Y,
   CARD_HERO_PITCH,
   CARD_HERO_YAW,
   cardCameraDistance,
@@ -57,10 +59,19 @@ import {
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const FONT_DIR = `${ROOT}.fonts`;
 
-/** Page background, matching the light `--background` token. */
-const BACKGROUND: readonly [number, number, number, number] = [
-  0.988, 0.988, 0.988, 1,
-];
+/**
+ * Page background, matching the forced-dark `--background` token.
+ *
+ * The alpha is 0: the card writes 1, so the scene target's alpha is its
+ * coverage and `present.wgsl` knows where the floor reflection may show.
+ */
+const BACKGROUND: readonly [number, number, number, number] = [0, 0, 0, 0];
+
+/** Blur radius of the floor reflection at the bottom of the frame, in uv. */
+const REFLECTION_BLUR = 0.01;
+
+/** Clear value of the reflection target: nothing, not even an alpha. */
+const TRANSPARENT: readonly [number, number, number, number] = [0, 0, 0, 0];
 
 /** Which frames to shoot. */
 type ViewName = "hero" | "edge" | "back";
@@ -76,6 +87,15 @@ interface Args {
   readonly views: readonly ViewName[];
   /** True when `--out` was given, which pins the file name for a single view. */
   readonly explicitOut: boolean;
+  /**
+   * `--pointer x,y` as viewport fractions, `0,0` top-left and `1,1`
+   * bottom-right, which is where the cursor would be. It lights the cursor lamp
+   * for the hero frame; omitting it leaves the lamp off, so every existing
+   * probe is unchanged.
+   */
+  readonly pointer?: readonly [number, number];
+  /** `--pitch <degrees>` overrides the hero pitch. */
+  readonly pitch?: number;
 }
 
 function parseArgs(argv: readonly string[]): Args {
@@ -96,6 +116,19 @@ function parseArgs(argv: readonly string[]): Args {
     view && VIEW_NAMES.includes(view as ViewName)
       ? [view as ViewName]
       : VIEW_NAMES;
+  const pointerArg = values.get("pointer");
+  const pointer = pointerArg
+    ? (pointerArg.split(",").map(Number) as [number, number])
+    : undefined;
+  if (
+    pointer &&
+    (!Number.isFinite(pointer[0]) || !Number.isFinite(pointer[1]))
+  ) {
+    throw new Error(
+      `--pointer wants "x,y" as viewport fractions, got "${pointerArg}"`
+    );
+  }
+  const pitchArg = values.get("pitch");
   return {
     preset,
     out: values.get("out") ?? `renders/${preset}.png`,
@@ -104,6 +137,8 @@ function parseArgs(argv: readonly string[]): Args {
     all,
     views,
     explicitOut: values.has("out"),
+    pointer,
+    pitch: pitchArg ? (Number(pitchArg) * Math.PI) / 180 : undefined,
   };
 }
 
@@ -248,6 +283,25 @@ function patchLuminance(
   return count > 0 ? total / count : 0;
 }
 
+/** Brightest pixel in a box centred on a pixel. */
+function peakLuminance(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  centerX: number,
+  centerY: number,
+  radius: number
+): number {
+  let peak = 0;
+  for (let y = centerY - radius; y <= centerY + radius; y += 1) {
+    for (let x = centerX - radius; x <= centerX + radius; x += 1) {
+      if (x < 0 || y < 0 || x >= width || y >= height) continue;
+      peak = Math.max(peak, luminance(pixels, (y * width + x) * 4));
+    }
+  }
+  return peak;
+}
+
 /** Etch mask value of the design at a point on the face, in millimetres. */
 function maskAt(
   design: Uint8Array,
@@ -261,8 +315,14 @@ function maskAt(
       ? (millimetreX + CARD_WIDTH / 2) / CARD_WIDTH
       : (CARD_WIDTH / 2 - millimetreX) / CARD_WIDTH;
   const v = (CARD_HEIGHT / 2 - millimetreY) / CARD_HEIGHT;
-  const x = Math.min(TEXTURE_WIDTH - 1, Math.max(0, Math.round(u * TEXTURE_WIDTH)));
-  const y = Math.min(TEXTURE_HEIGHT - 1, Math.max(0, Math.round(v * TEXTURE_HEIGHT)));
+  const x = Math.min(
+    TEXTURE_WIDTH - 1,
+    Math.max(0, Math.round(u * TEXTURE_WIDTH))
+  );
+  const y = Math.min(
+    TEXTURE_HEIGHT - 1,
+    Math.max(0, Math.round(v * TEXTURE_HEIGHT))
+  );
   return design[(y * TEXTURE_WIDTH + x) * 4 + 3] / 255;
 }
 
@@ -302,9 +362,11 @@ function probeFace(
   const bright: { x: number; y: number; value: number }[] = [];
 
   for (let iy = 0; iy <= steps; iy += 1) {
-    const my = -CARD_HEIGHT / 2 + inset + ((CARD_HEIGHT - 2 * inset) * iy) / steps;
+    const my =
+      -CARD_HEIGHT / 2 + inset + ((CARD_HEIGHT - 2 * inset) * iy) / steps;
     for (let ix = 0; ix <= steps; ix += 1) {
-      const mx = -CARD_WIDTH / 2 + inset + ((CARD_WIDTH - 2 * inset) * ix) / steps;
+      const mx =
+        -CARD_WIDTH / 2 + inset + ((CARD_WIDTH - 2 * inset) * ix) / steps;
       const centre = maskAt(design, side, mx, my);
       // Only interior samples count, so half-covered edge pixels never land in
       // either bucket.
@@ -360,6 +422,80 @@ function probeFace(
   };
 }
 
+/** Top edge of the mirrored card, in millimetres. */
+const REFLECTION_TOP = 2 * CARD_FLOOR_Y + CARD_HEIGHT / 2;
+
+interface ReflectionProbe {
+  /** Mean luminance over the whole reflection band. */
+  readonly mean: number;
+  /** Mean luminance of five equal rows, top to bottom. */
+  readonly rows: readonly number[];
+  /** True when every row is at most as bright as the one above it. */
+  readonly fading: boolean;
+}
+
+/**
+ * Reads the floor reflection: the band under the mirrored card's top edge,
+ * inside its horizontal extent, split into five rows.
+ *
+ * A real reflection gets dimmer with depth, so the rows must decrease.
+ */
+function probeReflection(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  viewProjection: Float32Array
+): ReflectionProbe {
+  const inset = 10;
+  const left = project(
+    viewProjection,
+    [-CARD_WIDTH / 2 + inset, REFLECTION_TOP, 0],
+    width,
+    height
+  );
+  const right = project(
+    viewProjection,
+    [CARD_WIDTH / 2 - inset, REFLECTION_TOP, 0],
+    width,
+    height
+  );
+  const top = project(viewProjection, [0, REFLECTION_TOP, 0], width, height);
+
+  const x0 = Math.max(0, Math.round(Math.min(left.x, right.x)));
+  const x1 = Math.min(width - 1, Math.round(Math.max(left.x, right.x)));
+  // A few pixels of slack so the mirrored card's own antialiased edge is out.
+  const y0 = Math.max(0, Math.round(Math.max(top.y, left.y, right.y)) + 4);
+  const y1 = height - 1;
+  if (x1 <= x0 || y1 - y0 < 5) {
+    return { mean: 0, rows: [], fading: false };
+  }
+
+  const bands = 5;
+  const rows: number[] = [];
+  let total = 0;
+  let count = 0;
+  for (let band = 0; band < bands; band += 1) {
+    const from = y0 + Math.round(((y1 - y0) * band) / bands);
+    const to = y0 + Math.round(((y1 - y0) * (band + 1)) / bands);
+    let bandTotal = 0;
+    let bandCount = 0;
+    for (let y = from; y < to; y += 1) {
+      for (let x = x0; x <= x1; x += 1) {
+        bandTotal += luminance(pixels, (y * width + x) * 4);
+        bandCount += 1;
+      }
+    }
+    rows.push(bandCount > 0 ? bandTotal / bandCount : 0);
+    total += bandTotal;
+    count += bandCount;
+  }
+
+  const fading = rows.every(
+    (value, index) => index === 0 || value <= rows[index - 1] + 0.002
+  );
+  return { mean: count > 0 ? total / count : 0, rows, fading };
+}
+
 interface ShotOptions {
   readonly yaw: number;
   readonly pitch: number;
@@ -368,6 +504,10 @@ interface ShotOptions {
   readonly sway: number;
   /** Tilt of the card itself about X, in radians. */
   readonly tilt?: number;
+  /** Cursor position as a viewport fraction; omitted leaves the lamp off. */
+  readonly pointer?: readonly [number, number];
+  /** Renders the mirrored floor pass. Off for the geometry-only frames. */
+  readonly reflection?: boolean;
 }
 
 /** Applies a column-major 4x4 matrix to a point. */
@@ -401,11 +541,18 @@ async function main(): Promise<void> {
   const { width, height } = args;
   const aspect = width / height;
   const scene = target(gpu, { size: [width, height], depth: true });
+  // The floor reflection is drawn at half resolution; the composite blurs it.
+  const reflection = target(gpu, {
+    size: [Math.max(1, width >> 1), Math.max(1, height >> 1)],
+    depth: true,
+  });
   const output = target(gpu, { size: [width, height] });
   const present = effect(gpu, presentShader.wgsl, {
     set: {
       scene,
       sceneSampler: sampler(gpu, { minFilter: "linear", magFilter: "linear" }),
+      reflection,
+      composite: { floorLine: 1, blur: REFLECTION_BLUR },
     },
   });
 
@@ -427,8 +574,26 @@ async function main(): Promise<void> {
     card.camera.lookAt([0, 0, 0]);
     card.animate(0, shot.sway);
     card.model.set({ rotation: [shot.tilt ?? 0, 0, 0] });
+    card.setPointer(
+      shot.pointer
+        ? card.pointerPlanePoint(
+            shot.pointer[0] * 2 - 1,
+            1 - shot.pointer[1] * 2
+          )
+        : [0, 0, 0],
+      shot.pointer ? 1 : 0
+    );
     card.sync();
+    present.set({
+      composite: { floorLine: card.floorLine(), blur: REFLECTION_BLUR },
+    });
     frame(gpu, (current) => {
+      current.pass(
+        { target: reflection, clear: TRANSPARENT, clearDepth: 1 },
+        (pass) => {
+          if (shot.reflection) pass.draw(card.reflectionDraw);
+        }
+      );
       current.pass(
         { target: scene, clear: BACKGROUND, clearDepth: 1 },
         (pass) => {
@@ -462,12 +627,14 @@ async function main(): Promise<void> {
 
     if (wanted.has("hero")) {
       const path = `${base}.png`;
-      const hero = await shoot(card, {
+      const heroShot: ShotOptions = {
         yaw: CARD_HERO_YAW,
-        pitch: CARD_HERO_PITCH,
+        pitch: args.pitch ?? CARD_HERO_PITCH,
         distance: cardCameraDistance(aspect),
         sway: 0,
-      });
+        reflection: true,
+      };
+      const hero = await shoot(card, { ...heroShot, pointer: args.pointer });
       const heroViewProjection = new Float32Array(card.camera.viewProjection);
       writePng(path, hero, width, height);
 
@@ -487,6 +654,30 @@ async function main(): Promise<void> {
         `highlight_ratio=${probe.highlightRatio.toFixed(2)}`,
         `probe_samples=${probe.samples}`
       );
+
+      const mirror = probeReflection(hero, width, height, heroViewProjection);
+      report.push(
+        `reflection_mean=${mirror.mean.toFixed(4)}`,
+        `reflection_rows=${mirror.rows.map((row) => row.toFixed(4)).join("/")}`,
+        `reflection_fading=${mirror.fading}`
+      );
+
+      // The cursor light is compared against the same frame without it, at the
+      // pixel the cursor sits on.
+      if (args.pointer) {
+        const dark = await shoot(card, heroShot);
+        const px = (args.pointer[0] * width) | 0;
+        const py = (args.pointer[1] * height) | 0;
+        const lit = patchLuminance(hero, width, height, px, py, 24, 24);
+        const unlit = patchLuminance(dark, width, height, px, py, 24, 24);
+        report.push(
+          `pointer_px=${px},${py}`,
+          `pointer_lit=${lit.toFixed(4)}`,
+          `pointer_unlit=${unlit.toFixed(4)}`,
+          `pointer_delta=${(lit - unlit).toFixed(4)}`,
+          `pointer_peak=${peakLuminance(hero, width, height, px, py, 24).toFixed(4)}`
+        );
+      }
 
       const flat = await shoot(card, {
         yaw: 0,
@@ -552,7 +743,11 @@ async function main(): Promise<void> {
       );
       const facePixel = project(
         edgeViewProjection,
-        transformPoint(edgeModel, [0, CARD_HEIGHT / 2 - 3, -CARD_THICKNESS / 2]),
+        transformPoint(edgeModel, [
+          0,
+          CARD_HEIGHT / 2 - 3,
+          -CARD_THICKNESS / 2,
+        ]),
         width,
         height
       );
