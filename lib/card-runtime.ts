@@ -34,6 +34,26 @@ const PITCH_RETURN_RATE = 2.5;
 
 const MAX_PITCH = (80 * Math.PI) / 180;
 
+/**
+ * Render budget in device pixels for the full-viewport canvas.
+ *
+ * The card shader is heavy (anisotropic GGX, four lights, relief and sparkle
+ * per pixel) and the target is multisampled, so a phone at DPR 3 would draw
+ * three to four million samples per frame. The DPR is clamped so the canvas
+ * never exceeds the budget; a touch device gets a smaller one than a desktop.
+ */
+const PIXEL_BUDGET_TOUCH = 1.4e6;
+const PIXEL_BUDGET_DESKTOP = 3.6e6;
+
+/** Largest DPR that keeps `canvas` inside the pixel budget, at least 1. */
+function budgetDpr(canvas: HTMLCanvasElement): number {
+  const isTouch = navigator.maxTouchPoints > 0;
+  const budget = isTouch ? PIXEL_BUDGET_TOUCH : PIXEL_BUDGET_DESKTOP;
+  const cssPixels = Math.max(1, canvas.clientWidth * canvas.clientHeight);
+  const fit = Math.sqrt(budget / cssPixels);
+  return Math.max(1, Math.min(window.devicePixelRatio || 1, fit));
+}
+
 /** Length of the one-shot intro move, in seconds. */
 const INTRO_DURATION = 1.6;
 
@@ -114,7 +134,7 @@ export function startCard(
 
       const background = readCssColor(document.body, "--background");
       const canvasSurface = surface(gpu, canvas, {
-        dpr: [1, 2],
+        dpr: [1, budgetDpr(canvas)],
         clearColor: background,
       });
       const [initialWidth, initialHeight] = canvasSurface.size;
