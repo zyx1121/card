@@ -33,6 +33,15 @@ export interface VgpuApi {
 /** Vertical field of view in degrees. */
 export const CARD_FOV = 30;
 
+/**
+ * The hero pose: a shallow three-quarter view from the card's left, which is
+ * how a metal card is shot for a product page. Radians.
+ */
+export const CARD_HERO_YAW = (-22 * Math.PI) / 180;
+
+/** Hero pitch, just above the card's plane. Radians. */
+export const CARD_HERO_PITCH = (8 * Math.PI) / 180;
+
 /** Idle yaw sway amplitude in radians (12 degrees). */
 const SWAY_YAW = (12 * Math.PI) / 180;
 
@@ -44,7 +53,7 @@ export interface CardSceneOptions {
   readonly preset: PresetName;
   readonly designs: Record<CardSide, Uint8Array>;
   readonly aspect: number;
-  /** Initial orbit pose, a three-quarter view by default. */
+  /** Initial orbit pose, the hero three-quarter view by default. */
   readonly yaw?: number;
   readonly pitch?: number;
 }
@@ -150,8 +159,8 @@ export function createCardScene(
 
   const placeCamera = (aspect: number): void => {
     const distance = cardCameraDistance(aspect);
-    const yaw = options.yaw ?? 0.42;
-    const pitch = options.pitch ?? 0.3;
+    const yaw = options.yaw ?? CARD_HERO_YAW;
+    const pitch = options.pitch ?? CARD_HERO_PITCH;
     camera.set({
       aspect,
       position: [

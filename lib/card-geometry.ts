@@ -9,14 +9,14 @@ import {
   CARD_WIDTH,
 } from "@/lib/card-spec";
 
-/** Floats per vertex: position(3) + normal(3) + uv(2) + face(1). */
-export const CARD_VERTEX_STRIDE_FLOATS = 9;
+/** Floats per vertex: position(3) + normal(3) + tangent(3) + uv(2) + face(1). */
+export const CARD_VERTEX_STRIDE_FLOATS = 12;
 
 /** Bytes per vertex of the interleaved vertex buffer. */
 export const CARD_VERTEX_STRIDE = CARD_VERTEX_STRIDE_FLOATS * 4;
 
 export interface CardMesh {
-  /** Interleaved position/normal/uv/face vertex data. */
+  /** Interleaved position/normal/tangent/uv/face vertex data. */
   readonly vertices: Float32Array<ArrayBuffer>;
   /** Triangle list indices. */
   readonly indices: Uint16Array<ArrayBuffer>;
@@ -84,9 +84,12 @@ function buildRing(): RingPoint[] {
  * Builds an extruded rounded rectangle: front face, back face and a side wall.
  *
  * Front UVs map the whole 90x54 mm face to 0..1. Back UVs are mirrored on X so
- * the printed text reads correctly once the card is flipped about its vertical
+ * the etched text reads correctly once the card is flipped about its vertical
  * axis. The edge wall runs uv.x along the perimeter and uv.y across the
  * thickness.
+ *
+ * Every vertex also carries a tangent, which the shader needs for the brushed
+ * anisotropic lobe and which must be in model space so the card can rotate.
  */
 export function buildCardMesh(): CardMesh {
   const ring = buildRing();
@@ -104,11 +107,14 @@ export function buildCardMesh(): CardMesh {
     nx: number,
     ny: number,
     nz: number,
+    tx: number,
+    ty: number,
+    tz: number,
     u: number,
     v: number,
     face: number
   ): number => {
-    vertices.push(x, y, z, nx, ny, nz, u, v, face);
+    vertices.push(x, y, z, nx, ny, nz, tx, ty, tz, u, v, face);
     vertexCount += 1;
     return vertexCount - 1;
   };
@@ -121,6 +127,9 @@ export function buildCardMesh(): CardMesh {
     0,
     0,
     1,
+    1,
+    0,
+    0,
     0.5,
     0.5,
     CARD_FACE.front
@@ -134,6 +143,9 @@ export function buildCardMesh(): CardMesh {
       0,
       0,
       1,
+      1,
+      0,
+      0,
       (point.x + CARD_WIDTH / 2) / CARD_WIDTH,
       (CARD_HEIGHT / 2 - point.y) / CARD_HEIGHT,
       CARD_FACE.front
@@ -155,6 +167,9 @@ export function buildCardMesh(): CardMesh {
     0,
     0,
     -1,
+    -1,
+    0,
+    0,
     0.5,
     0.5,
     CARD_FACE.back
@@ -168,6 +183,9 @@ export function buildCardMesh(): CardMesh {
       0,
       0,
       -1,
+      -1,
+      0,
+      0,
       (CARD_WIDTH / 2 - point.x) / CARD_WIDTH,
       (CARD_HEIGHT / 2 - point.y) / CARD_HEIGHT,
       CARD_FACE.back
@@ -180,12 +198,17 @@ export function buildCardMesh(): CardMesh {
   // Side wall: one quad per ring segment, outward normals from the outline.
   const edgeStart = vertexCount;
   for (const point of ring) {
+    // The rim is milled around the perimeter, so its brushing runs along the
+    // outline rather than along the card's long axis.
     push(
       point.x,
       point.y,
       halfThickness,
       point.nx,
       point.ny,
+      0,
+      -point.ny,
+      point.nx,
       0,
       point.s,
       1,
@@ -197,6 +220,9 @@ export function buildCardMesh(): CardMesh {
       -halfThickness,
       point.nx,
       point.ny,
+      0,
+      -point.ny,
+      point.nx,
       0,
       point.s,
       0,
@@ -231,6 +257,7 @@ export function cardGeometryOptions(): GeometryOptions {
         attributes: {
           position: "float32x3",
           normal: "float32x3",
+          tangent: "float32x3",
           uv: "float32x2",
           face: "float32",
         } as const,

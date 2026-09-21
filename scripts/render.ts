@@ -5,7 +5,8 @@
  * uses, through `vgpu/node`, and writes PNGs plus a few pixel assertions so a
  * render can be judged without a GPU or a browser.
  *
- *   bun run scripts/render.ts --preset paper --out renders/paper.png
+ *   bun run scripts/render.ts --preset titanium --out renders/titanium.png
+ *   bun run scripts/render.ts --preset titanium --view back
  *   bun run scripts/render.ts --all
  */
 
@@ -13,7 +14,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
+import { createCanvas, GlobalFonts, Path2D } from "@napi-rs/canvas";
 import { PNG } from "pngjs";
 import { resolveShader } from "@vgpu/wgsl/runtime";
 import {
@@ -28,6 +29,8 @@ import {
 } from "vgpu/node";
 
 import {
+  CARD_HERO_PITCH,
+  CARD_HERO_YAW,
   cardCameraDistance,
   createCardScene,
   type VgpuApi,
@@ -40,6 +43,7 @@ import {
 import {
   CARD_HEIGHT,
   CARD_THICKNESS,
+  CARD_WIDTH,
   TEXTURE_HEIGHT,
   TEXTURE_WIDTH,
 } from "@/lib/card-spec";
@@ -47,6 +51,7 @@ import {
   drawCardFace,
   type Canvas2DLike,
   type CardSide,
+  type Path2DConstructor,
 } from "@/lib/card-texture";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -57,12 +62,20 @@ const BACKGROUND: readonly [number, number, number, number] = [
   0.988, 0.988, 0.988, 1,
 ];
 
+/** Which frames to shoot. */
+type ViewName = "hero" | "edge" | "back";
+
+const VIEW_NAMES: readonly ViewName[] = ["hero", "edge", "back"];
+
 interface Args {
   readonly preset: PresetName;
   readonly out: string;
   readonly width: number;
   readonly height: number;
   readonly all: boolean;
+  readonly views: readonly ViewName[];
+  /** True when `--out` was given, which pins the file name for a single view. */
+  readonly explicitOut: boolean;
 }
 
 function parseArgs(argv: readonly string[]): Args {
@@ -78,12 +91,19 @@ function parseArgs(argv: readonly string[]): Args {
     }
   }
   const preset = resolvePreset(values.get("preset"));
+  const view = values.get("view");
+  const views =
+    view && VIEW_NAMES.includes(view as ViewName)
+      ? [view as ViewName]
+      : VIEW_NAMES;
   return {
     preset,
     out: values.get("out") ?? `renders/${preset}.png`,
     width: Number(values.get("width") ?? 1600),
     height: Number(values.get("height") ?? 1000),
     all,
+    views,
+    explicitOut: values.has("out"),
   };
 }
 
@@ -108,7 +128,9 @@ function renderDesigns(): Record<CardSide, Uint8Array> {
   for (const side of sides) {
     const canvas = createCanvas(TEXTURE_WIDTH, TEXTURE_HEIGHT);
     const context = canvas.getContext("2d");
-    drawCardFace(context as unknown as Canvas2DLike, side);
+    drawCardFace(context as unknown as Canvas2DLike, side, {
+      Path2D: Path2D as unknown as Path2DConstructor,
+    });
     const image = context.getImageData(0, 0, TEXTURE_WIDTH, TEXTURE_HEIGHT);
     result[side] = new Uint8Array(image.data.buffer.slice(0));
   }
@@ -169,22 +191,13 @@ function silhouette(pixels: Uint8Array, width: number, height: number): Bounds {
   return bounds;
 }
 
-function percentileLuminance(
-  pixels: Uint8Array,
-  width: number,
-  height: number,
-  percentile: number
-): number {
-  const values: number[] = [];
-  for (let i = 0; i < width * height; i += 1) {
-    const index = i * 4;
-    if (isCard(pixels, index)) values.push(luminance(pixels, index));
-  }
-  if (values.length === 0) return 0;
-  values.sort((a, b) => a - b);
-  return values[
-    Math.min(values.length - 1, Math.floor(values.length * percentile))
-  ];
+function percentile(sorted: readonly number[], fraction: number): number {
+  if (sorted.length === 0) return 0;
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.floor(sorted.length * fraction))
+  );
+  return sorted[index];
 }
 
 /** Projects a scene-space point to pixel coordinates. */
@@ -203,39 +216,6 @@ function project(
     x: ((clipX / clipW) * 0.5 + 0.5) * width,
     y: (1 - ((clipY / clipW) * 0.5 + 0.5)) * height,
   };
-}
-
-/**
- * Luminance of the printed ink inside a rectangle.
- *
- * Returns the pixel that departs furthest from the bare stock, so it works for
- * dark ink on white and for pale gold on black alike.
- */
-function inkLuminanceInRect(
-  pixels: Uint8Array,
-  width: number,
-  height: number,
-  a: { x: number; y: number },
-  b: { x: number; y: number },
-  stock: number
-): number {
-  let best = stock;
-  for (
-    let y = Math.round(Math.min(a.y, b.y));
-    y <= Math.max(a.y, b.y);
-    y += 1
-  ) {
-    for (
-      let x = Math.round(Math.min(a.x, b.x));
-      x <= Math.max(a.x, b.x);
-      x += 1
-    ) {
-      if (x < 0 || y < 0 || x >= width || y >= height) continue;
-      const value = luminance(pixels, (y * width + x) * 4);
-      if (Math.abs(value - stock) > Math.abs(best - stock)) best = value;
-    }
-  }
-  return best;
 }
 
 /** Mean luminance of a small box centred on a pixel. */
@@ -266,6 +246,118 @@ function patchLuminance(
     }
   }
   return count > 0 ? total / count : 0;
+}
+
+/** Etch mask value of the design at a point on the face, in millimetres. */
+function maskAt(
+  design: Uint8Array,
+  side: CardSide,
+  millimetreX: number,
+  millimetreY: number
+): number {
+  // Back UVs are mirrored on X, matching `buildCardMesh`.
+  const u =
+    side === "front"
+      ? (millimetreX + CARD_WIDTH / 2) / CARD_WIDTH
+      : (CARD_WIDTH / 2 - millimetreX) / CARD_WIDTH;
+  const v = (CARD_HEIGHT / 2 - millimetreY) / CARD_HEIGHT;
+  const x = Math.min(TEXTURE_WIDTH - 1, Math.max(0, Math.round(u * TEXTURE_WIDTH)));
+  const y = Math.min(TEXTURE_HEIGHT - 1, Math.max(0, Math.round(v * TEXTURE_HEIGHT)));
+  return design[(y * TEXTURE_WIDTH + x) * 4 + 3] / 255;
+}
+
+interface FaceProbe {
+  /** Contrast between the bare coating and the etched floor. */
+  readonly etchContrast: number;
+  /** p90 minus p10 of the bare coating, i.e. the gradient across the face. */
+  readonly faceGradient: number;
+  /** Width over height of the brightest patch on the bare coating. */
+  readonly highlightRatio: number;
+  readonly bare: number;
+  readonly etched: number;
+  readonly samples: number;
+}
+
+/**
+ * Walks a grid across the visible face in card space, projects every point and
+ * reads the rendered pixel under it.
+ *
+ * Sampling in card space rather than in screen space means the etched marks and
+ * the bare coating can be told apart from the design texture itself, instead of
+ * by guessing at a threshold, and it keeps the rim out of the statistics.
+ */
+function probeFace(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  viewProjection: Float32Array,
+  design: Uint8Array,
+  side: CardSide
+): FaceProbe {
+  const z = (side === "front" ? 1 : -1) * (CARD_THICKNESS / 2);
+  const inset = 1.5;
+  const steps = 260;
+  const bare: number[] = [];
+  const etched: number[] = [];
+  const bright: { x: number; y: number; value: number }[] = [];
+
+  for (let iy = 0; iy <= steps; iy += 1) {
+    const my = -CARD_HEIGHT / 2 + inset + ((CARD_HEIGHT - 2 * inset) * iy) / steps;
+    for (let ix = 0; ix <= steps; ix += 1) {
+      const mx = -CARD_WIDTH / 2 + inset + ((CARD_WIDTH - 2 * inset) * ix) / steps;
+      const centre = maskAt(design, side, mx, my);
+      // Only interior samples count, so half-covered edge pixels never land in
+      // either bucket.
+      const neighbours = [
+        maskAt(design, side, mx + 0.2, my),
+        maskAt(design, side, mx - 0.2, my),
+        maskAt(design, side, mx, my + 0.2),
+        maskAt(design, side, mx, my - 0.2),
+      ];
+      const isEtched = centre > 0.9 && neighbours.every((value) => value > 0.9);
+      const isBare = centre < 0.02 && neighbours.every((value) => value < 0.02);
+      if (!isEtched && !isBare) continue;
+
+      const point = project(viewProjection, [mx, my, z], width, height);
+      const px = Math.round(point.x);
+      const py = Math.round(point.y);
+      if (px < 0 || py < 0 || px >= width || py >= height) continue;
+      const value = luminance(pixels, (py * width + px) * 4);
+      if (isEtched) {
+        etched.push(value);
+      } else {
+        bare.push(value);
+        bright.push({ x: px, y: py, value });
+      }
+    }
+  }
+
+  bare.sort((a, b) => a - b);
+  etched.sort((a, b) => a - b);
+  const bareMedian = percentile(bare, 0.5);
+  // The darkest decile of the etch, which is its floor rather than its bevel.
+  const etchedFloor = percentile(etched, 0.1);
+
+  const threshold = percentile(bare, 0.95);
+  const box: Bounds = { minX: width, maxX: -1, minY: height, maxY: -1 };
+  for (const sample of bright) {
+    if (sample.value < threshold) continue;
+    box.minX = Math.min(box.minX, sample.x);
+    box.maxX = Math.max(box.maxX, sample.x);
+    box.minY = Math.min(box.minY, sample.y);
+    box.maxY = Math.max(box.maxY, sample.y);
+  }
+  const boxWidth = box.maxX - box.minX + 1;
+  const boxHeight = box.maxY - box.minY + 1;
+
+  return {
+    etchContrast: Math.abs(bareMedian - etchedFloor),
+    faceGradient: percentile(bare, 0.9) - percentile(bare, 0.1),
+    highlightRatio: boxHeight > 0 ? boxWidth / boxHeight : 0,
+    bare: bareMedian,
+    etched: etchedFloor,
+    samples: bare.length + etched.length,
+  };
 }
 
 interface ShotOptions {
@@ -358,134 +450,139 @@ async function main(): Promise<void> {
       aspect,
     });
 
-    const heroPath = args.all ? `renders/${preset}.png` : args.out;
-    const edgePath = heroPath.replace(/\.png$/, "-edge.png");
+    const base = (args.all ? `renders/${preset}.png` : args.out).replace(
+      /\.png$/,
+      ""
+    );
+    const report: string[] = [`preset=${preset}`];
+    const wanted = new Set(args.views);
+    // A single view only takes the bare `--out` path when the caller named one,
+    // so `--view edge` on its own can never overwrite the hero frame.
+    const single = args.views.length === 1 && args.explicitOut;
 
-    const hero = await shoot(card, {
-      yaw: 0.46,
-      pitch: 0.3,
-      distance: cardCameraDistance(aspect),
-      sway: 0,
-    });
-    writePng(heroPath, hero, width, height);
+    if (wanted.has("hero")) {
+      const path = `${base}.png`;
+      const hero = await shoot(card, {
+        yaw: CARD_HERO_YAW,
+        pitch: CARD_HERO_PITCH,
+        distance: cardCameraDistance(aspect),
+        sway: 0,
+      });
+      const heroViewProjection = new Float32Array(card.camera.viewProjection);
+      writePng(path, hero, width, height);
 
-    // Macro of the cut edge: the card is tipped almost edge-on and the camera
-    // moves in until the 0.35 mm wall is more than ten pixels tall.
-    const EDGE_TILT = (78 * Math.PI) / 180;
-    const edge = await shoot(card, {
-      yaw: 0.16,
-      pitch: 0.1,
-      distance: 52,
-      sway: 0,
-      tilt: EDGE_TILT,
-    });
-    const edgeViewProjection = new Float32Array(card.camera.viewProjection);
-    const edgeModel = new Float32Array(card.model.worldMatrix);
-    writePng(edgePath, edge, width, height);
+      const probe = probeFace(
+        hero,
+        width,
+        height,
+        heroViewProjection,
+        designs.front,
+        "front"
+      );
+      report.push(
+        `face=${probe.bare.toFixed(4)}`,
+        `etch=${probe.etched.toFixed(4)}`,
+        `etch_contrast=${probe.etchContrast.toFixed(4)}`,
+        `face_gradient=${probe.faceGradient.toFixed(4)}`,
+        `highlight_ratio=${probe.highlightRatio.toFixed(2)}`,
+        `probe_samples=${probe.samples}`
+      );
 
-    const flat = await shoot(card, {
-      yaw: 0,
-      pitch: 0,
-      distance: cardCameraDistance(aspect),
-      sway: 0,
-    });
+      const flat = await shoot(card, {
+        yaw: 0,
+        pitch: 0,
+        distance: cardCameraDistance(aspect),
+        sway: 0,
+      });
+      const flatBounds = silhouette(flat, width, height);
+      const flatAspect =
+        (flatBounds.maxX - flatBounds.minX + 1) /
+        (flatBounds.maxY - flatBounds.minY + 1);
+      report.push(`silhouette_aspect=${flatAspect.toFixed(4)}/1.6667`);
+      report.push(`-> ${path}`);
+    }
 
-    const flatBounds = silhouette(flat, width, height);
-    const flatAspect =
-      (flatBounds.maxX - flatBounds.minX + 1) /
-      (flatBounds.maxY - flatBounds.minY + 1);
+    if (wanted.has("back")) {
+      const path = single ? `${base}.png` : `${base}-back.png`;
+      const back = await shoot(card, {
+        yaw: Math.PI + CARD_HERO_YAW,
+        pitch: CARD_HERO_PITCH,
+        distance: cardCameraDistance(aspect),
+        sway: 0,
+      });
+      const backViewProjection = new Float32Array(card.camera.viewProjection);
+      writePng(path, back, width, height);
+      const probe = probeFace(
+        back,
+        width,
+        height,
+        backViewProjection,
+        designs.back,
+        "back"
+      );
+      report.push(
+        `back_etch_contrast=${probe.etchContrast.toFixed(4)}`,
+        `back_face_gradient=${probe.faceGradient.toFixed(4)}`,
+        `-> ${path}`
+      );
+    }
 
-    // The 0.35 mm cut edge and the printed face 3 mm below it, located by
-    // projecting known scene points instead of guessing at the silhouette.
-    const edgePixel = project(
-      edgeViewProjection,
-      transformPoint(edgeModel, [0, CARD_HEIGHT / 2, 0]),
-      width,
-      height
-    );
-    const facePixel = project(
-      edgeViewProjection,
-      transformPoint(edgeModel, [0, CARD_HEIGHT / 2 - 3, CARD_THICKNESS / 2]),
-      width,
-      height
-    );
-    const edgeLuminance = patchLuminance(
-      edge,
-      width,
-      height,
-      edgePixel.x,
-      edgePixel.y,
-      40,
-      1
-    );
-    const faceLuminance = patchLuminance(
-      edge,
-      width,
-      height,
-      facePixel.x,
-      facePixel.y,
-      40,
-      1
-    );
+    if (wanted.has("edge")) {
+      const path = single ? `${base}.png` : `${base}-edge.png`;
+      // Macro of the milled rim: the card is tipped almost edge-on and the
+      // camera climbs above it, so the frame holds the lit back face and, along
+      // its top, the 0.76 mm wall catching the key.
+      const EDGE_TILT = (72 * Math.PI) / 180;
+      const edge = await shoot(card, {
+        yaw: 0.16,
+        pitch: 0.38,
+        distance: 66,
+        sway: 0,
+        tilt: EDGE_TILT,
+      });
+      const edgeViewProjection = new Float32Array(card.camera.viewProjection);
+      const edgeModel = new Float32Array(card.model.worldMatrix);
+      writePng(path, edge, width, height);
 
-    // Ink versus bare stock, read off the hero frame at known card positions.
-    const heroViewProjection = new Float32Array(card.camera.viewProjection);
-    const nameTopLeft = project(
-      heroViewProjection,
-      [-35, 11, CARD_THICKNESS / 2],
-      width,
-      height
-    );
-    const nameBottomRight = project(
-      heroViewProjection,
-      [-19, 1, CARD_THICKNESS / 2],
-      width,
-      height
-    );
-    const stockPixel = project(
-      heroViewProjection,
-      [26, -18, CARD_THICKNESS / 2],
-      width,
-      height
-    );
-    const stockLuminance = patchLuminance(
-      hero,
-      width,
-      height,
-      stockPixel.x,
-      stockPixel.y,
-      25,
-      25
-    );
-    const inkLuminance = inkLuminanceInRect(
-      hero,
-      width,
-      height,
-      nameTopLeft,
-      nameBottomRight,
-      stockLuminance
-    );
-
-    const highlight = percentileLuminance(hero, width, height, 0.999);
-    const median = percentileLuminance(hero, width, height, 0.5);
-
-    console.log(
-      [
-        `preset=${preset}`,
-        `silhouette_aspect=${flatAspect.toFixed(4)}/1.6667`,
+      const edgePixel = project(
+        edgeViewProjection,
+        transformPoint(edgeModel, [0, CARD_HEIGHT / 2, 0]),
+        width,
+        height
+      );
+      const facePixel = project(
+        edgeViewProjection,
+        transformPoint(edgeModel, [0, CARD_HEIGHT / 2 - 3, -CARD_THICKNESS / 2]),
+        width,
+        height
+      );
+      const edgeLuminance = patchLuminance(
+        edge,
+        width,
+        height,
+        edgePixel.x,
+        edgePixel.y,
+        40,
+        1
+      );
+      const faceLuminance = patchLuminance(
+        edge,
+        width,
+        height,
+        facePixel.x,
+        facePixel.y,
+        40,
+        1
+      );
+      report.push(
         `edge_luma=${edgeLuminance.toFixed(4)}`,
-        `face_luma=${faceLuminance.toFixed(4)}`,
+        `rim_face_luma=${faceLuminance.toFixed(4)}`,
         `edge_delta=${Math.abs(edgeLuminance - faceLuminance).toFixed(4)}`,
-        `ink=${inkLuminance.toFixed(4)}`,
-        `stock=${stockLuminance.toFixed(4)}`,
-        `ink_contrast=${Math.abs(stockLuminance - inkLuminance).toFixed(4)}`,
-        `highlight_p999=${highlight.toFixed(4)}`,
-        `median=${median.toFixed(4)}`,
-        `contrast=${(highlight - median).toFixed(4)}`,
-        `-> ${heroPath} ${edgePath}`,
-      ].join(" ")
-    );
+        `-> ${path}`
+      );
+    }
 
+    console.log(report.join(" "));
     card.destroy();
   }
 
