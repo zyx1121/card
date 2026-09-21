@@ -25,8 +25,11 @@ import {
 import type { PresetName } from "@/lib/card-presets";
 import { renderCardFacesInBrowser } from "@/lib/card-texture";
 
-/** Seconds of stillness before the idle sway fades back in. */
-const RESUME_DELAY = 2;
+/** Seconds after the pointer is released before the spin resumes. */
+const RESUME_DELAY = 3;
+
+/** Easing rate (per second) for the camera pitch returning to its home value. */
+const PITCH_RETURN_RATE = 2.5;
 
 const MAX_PITCH = (80 * Math.PI) / 180;
 
@@ -126,15 +129,25 @@ export function startCard(
       });
       controls.set({ distance });
 
-      // The idle sway pauses while the card is being dragged, then eases back.
-      let idleSince = 0;
-      let swayAmount = 1;
-      const markInteraction = () => {
-        idleSince = 0;
+      // The spin stops while the pointer is down and resumes RESUME_DELAY
+      // seconds after release; the camera pitch eases back to its home value.
+      const homePitch = controls.pitch;
+      let pointerDown = false;
+      let sinceRelease = RESUME_DELAY;
+      const onPointerDown = () => {
+        pointerDown = true;
       };
-      canvas.addEventListener("pointerdown", markInteraction);
-      canvas.addEventListener("pointermove", markInteraction);
-      canvas.addEventListener("wheel", markInteraction, { passive: true });
+      const onPointerUp = () => {
+        pointerDown = false;
+        sinceRelease = 0;
+      };
+      const onWheel = () => {
+        sinceRelease = 0;
+      };
+      canvas.addEventListener("pointerdown", onPointerDown);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
+      canvas.addEventListener("wheel", onWheel, { passive: true });
 
       const unsubscribeResize = canvasSurface.onResize((event) => {
         scene.resize([event.width, event.height]);
@@ -157,14 +170,21 @@ export function startCard(
       const time = clock(gpu);
       loop = frameLoop(gpu, (frame) => {
         const delta = time.deltaTime;
-        const moved = controls.update(delta);
-        if (moved) idleSince = 0;
-        idleSince += delta;
+        if (!pointerDown) {
+          sinceRelease += delta;
+          const pitchError = homePitch - controls.pitch;
+          if (Math.abs(pitchError) > 1e-4) {
+            controls.set({
+              pitch:
+                controls.pitch +
+                pitchError * Math.min(1, delta * PITCH_RETURN_RATE),
+            });
+          }
+        }
+        controls.update(delta);
 
-        const targetAmount = idleSince > RESUME_DELAY ? 1 : 0;
-        swayAmount += (targetAmount - swayAmount) * Math.min(1, delta * 1.5);
-
-        card.animate(time.time, swayAmount);
+        const spinning = !pointerDown && sinceRelease >= RESUME_DELAY;
+        card.animate(time.time, spinning ? 1 : 0);
         card.sync();
 
         frame.pass({ target: scene, clear: true, clearDepth: 1 }, (pass) => {
@@ -174,9 +194,10 @@ export function startCard(
       });
 
       const teardown = () => {
-        canvas.removeEventListener("pointerdown", markInteraction);
-        canvas.removeEventListener("pointermove", markInteraction);
-        canvas.removeEventListener("wheel", markInteraction);
+        canvas.removeEventListener("pointerdown", onPointerDown);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        canvas.removeEventListener("wheel", onWheel);
         unsubscribeResize();
         controls.dispose();
         card.destroy();
