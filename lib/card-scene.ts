@@ -42,11 +42,8 @@ export const CARD_HERO_YAW = (-22 * Math.PI) / 180;
 /** Hero pitch, just above the card's plane. Radians. */
 export const CARD_HERO_PITCH = (8 * Math.PI) / 180;
 
-/** Idle yaw sway amplitude in radians (12 degrees). */
-const SWAY_YAW = (12 * Math.PI) / 180;
-
-/** Idle float amplitude in millimetres. */
-const SWAY_FLOAT = 1.1;
+/** Idle spin speed in radians per second: one full turn every 9 seconds. */
+const SPIN_SPEED = (2 * Math.PI) / 9;
 
 export interface CardSceneOptions {
   readonly shader: string | ShaderSource;
@@ -81,7 +78,7 @@ export interface CardScene {
   readonly draw: Draw;
   readonly camera: PerspectiveCamera;
   readonly model: SceneNode;
-  /** Applies the idle sway; `amount` fades it out while the user is dragging. */
+  /** Advances the idle spin; `amount` fades it out while the user is dragging. */
   animate(time: number, amount: number): void;
   /** Uploads camera and model matrices for the current frame. */
   sync(): void;
@@ -174,15 +171,18 @@ export function createCardScene(
 
   placeCamera(options.aspect);
 
+  let spinYaw = 0;
+  let lastTime: number | undefined;
+
   return {
     draw,
     camera,
     model,
     animate(time: number, amount: number): void {
-      model.set({
-        rotation: [0, Math.sin(time * 0.33) * SWAY_YAW * amount, 0],
-        position: [0, Math.sin(time * 0.52) * SWAY_FLOAT * amount, 0],
-      });
+      const delta = lastTime === undefined ? 0 : Math.max(0, time - lastTime);
+      lastTime = time;
+      spinYaw = (spinYaw + delta * SPIN_SPEED * amount) % (2 * Math.PI);
+      model.set({ rotation: [0, spinYaw, 0] });
     },
     sync(): void {
       draw.set({
