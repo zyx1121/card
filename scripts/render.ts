@@ -6,8 +6,8 @@
  * assertions so a render can be judged without a GPU or a browser.
  *
  *   bun run scripts/render.ts --preset titanium --out renders/titanium.png
- *   bun run scripts/render.ts --fx splat --view hero --splats 8000
- *   bun run scripts/render.ts --view hero --yaw 70 --dpr 2
+ *   bun run scripts/render.ts --view hero --yaw 70
+ *   bun run scripts/render.ts --view hero --pointer 0.62,0.45
  *   bun run scripts/render.ts --all
  */
 
@@ -36,15 +36,6 @@ import {
   createCardScene,
   type VgpuApi,
 } from "@/lib/card-scene";
-import {
-  FX_NAMES,
-  OUTLINE_COLOR,
-  OUTLINE_PX,
-  SPLAT_COUNT,
-  fxMode,
-  resolveFx,
-  type CardFx,
-} from "@/lib/card-fx";
 import {
   PRESET_NAMES,
   resolvePreset,
@@ -78,17 +69,6 @@ const BACKGROUND: readonly [number, number, number] = [0, 0, 0];
 /** Clear value of the card target: nothing at all, not even an alpha. */
 const TRANSPARENT: readonly [number, number, number, number] = [0, 0, 0, 0];
 
-/**
- * Outline colour for the width probe.
- *
- * The delivered frames draw a black line on a black background, which cannot be
- * measured from the outside. A pure red line can: the card is near-neutral, so
- * `red - green` recovers the line's own coverage over both the background and
- * the card, and summing it across a silhouette crossing gives a sub-pixel
- * width.
- */
-const PROBE_OUTLINE: readonly [number, number, number] = [1, 0, 0];
-
 /** Which frames to shoot. */
 type ViewName = "hero" | "edge" | "back";
 
@@ -96,7 +76,6 @@ const VIEW_NAMES: readonly ViewName[] = ["hero", "edge", "back"];
 
 interface Args {
   readonly preset: PresetName;
-  readonly fx: CardFx;
   readonly out: string;
   readonly width: number;
   readonly height: number;
@@ -113,35 +92,21 @@ interface Args {
   readonly pointer?: readonly [number, number];
   /** `--yaw <degrees>` overrides the hero yaw, for a steep three-quarter view. */
   readonly yaw?: number;
-  /** `--dpr <n>` scales the outline, as a device pixel ratio would. */
-  readonly dpr: number;
-  /** `--splats <n>` thins the cloud, for slow software adapters. */
-  readonly splats: number;
-  /** `--probe` keeps the red-outline frame the width probe measures. */
-  readonly probe: boolean;
 }
 
 function parseArgs(argv: readonly string[]): Args {
   const values = new Map<string, string>();
   let all = false;
-  let probe = false;
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === "--all") {
       all = true;
-    } else if (token === "--probe") {
-      probe = true;
     } else if (token.startsWith("--")) {
       values.set(token.slice(2), argv[i + 1] ?? "");
       i += 1;
     }
   }
   const preset = resolvePreset(values.get("preset"));
-  const fxArg = values.get("fx");
-  if (fxArg !== undefined && !FX_NAMES.includes(fxArg as CardFx)) {
-    throw new Error(`--fx wants one of ${FX_NAMES.join(", ")}, got "${fxArg}"`);
-  }
-  const fx = resolveFx(fxArg);
   const view = values.get("view");
   const views =
     view && VIEW_NAMES.includes(view as ViewName)
@@ -162,7 +127,6 @@ function parseArgs(argv: readonly string[]): Args {
   const yawArg = values.get("yaw");
   return {
     preset,
-    fx,
     out: values.get("out") ?? `renders/${preset}.png`,
     width: Number(values.get("width") ?? 1600),
     height: Number(values.get("height") ?? 1000),
@@ -171,9 +135,6 @@ function parseArgs(argv: readonly string[]): Args {
     explicitOut: values.has("out"),
     pointer,
     yaw: yawArg ? (Number(yawArg) * Math.PI) / 180 : undefined,
-    dpr: Number(values.get("dpr") ?? 1),
-    splats: Number(values.get("splats") ?? SPLAT_COUNT),
-    probe,
   };
 }
 
@@ -480,131 +441,6 @@ function underCardLuminance(
   return count > 0 ? total / count : 0;
 }
 
-/**
- * Four points on the card's silhouette, in model millimetres, each with the
- * direction the outline runs in there.
- *
- * They sit at mid-thickness on the middle of each side, which is on the
- * silhouette of an extruded rounded rectangle from any viewing angle.
- */
-const OUTLINE_SAMPLES: readonly {
-  readonly name: string;
-  readonly point: readonly [number, number, number];
-  readonly along: readonly [number, number, number];
-}[] = [
-  { name: "left", point: [-CARD_WIDTH / 2, 0, 0], along: [0, 1, 0] },
-  { name: "right", point: [CARD_WIDTH / 2, 0, 0], along: [0, 1, 0] },
-  { name: "top", point: [0, CARD_HEIGHT / 2, 0], along: [1, 0, 0] },
-  { name: "bottom", point: [0, -CARD_HEIGHT / 2, 0], along: [1, 0, 0] },
-];
-
-/** Bilinear read of the outline's own coverage at a fractional pixel. */
-function outlineCoverage(
-  pixels: Uint8Array,
-  width: number,
-  height: number,
-  x: number,
-  y: number
-): number {
-  const at = (px: number, py: number): number => {
-    const cx = Math.min(width - 1, Math.max(0, px));
-    const cy = Math.min(height - 1, Math.max(0, py));
-    const index = (cy * width + cx) * 4;
-    // The probe frame draws the line in pure red over a near-neutral card, so
-    // red minus green is the line's own coverage, on the card and off it.
-    return Math.min(1, Math.max(0, (pixels[index] - pixels[index + 1]) / 255));
-  };
-  const x0 = Math.floor(x);
-  const y0 = Math.floor(y);
-  const fx = x - x0;
-  const fy = y - y0;
-  return (
-    at(x0, y0) * (1 - fx) * (1 - fy) +
-    at(x0 + 1, y0) * fx * (1 - fy) +
-    at(x0, y0 + 1) * (1 - fx) * fy +
-    at(x0 + 1, y0 + 1) * fx * fy
-  );
-}
-
-/**
- * Outline width at each of {@link OUTLINE_SAMPLES}, in pixels.
- *
- * The line is measured across itself rather than along a screen axis: the
- * outline's screen direction comes from projecting a second point a little way
- * along the same side, and the integration walks the perpendicular. A scan down
- * a column would read a slanted edge as `width / cos(angle)` and make a
- * constant-width line look like it changed with the card's angle, which is the
- * one thing this probe exists to rule out.
- *
- * The band is found in the pixels rather than assumed to sit on the projected
- * point: a mid-thickness sample point is a pixel or two off the silhouette the
- * rasteriser actually drew, because the silhouette is formed by whichever face
- * of the 0.76 mm slab is turned towards the camera. So the walk starts at the
- * strongest coverage near the sample and runs out to where the line ends.
- */
-function outlineProbe(
-  pixels: Uint8Array,
-  width: number,
-  height: number,
-  viewProjection: Float32Array,
-  model: Float32Array,
-  outlineWidth: number
-): { name: string; width: number }[] {
-  const SEARCH = 8;
-  const STEP = 0.1;
-  const FLOOR = 0.03;
-  // Far enough to hold the whole line, near enough to leave out a face-versus-
-  // rim crease line that has separated from it.
-  const reach = outlineWidth;
-  return OUTLINE_SAMPLES.map(({ name, point, along }) => {
-    const here = project(
-      viewProjection,
-      transformPoint(model, point),
-      width,
-      height
-    );
-    const ahead = project(
-      viewProjection,
-      transformPoint(model, [
-        point[0] + along[0] * 4,
-        point[1] + along[1] * 4,
-        point[2] + along[2] * 4,
-      ]),
-      width,
-      height
-    );
-    const dx = ahead.x - here.x;
-    const dy = ahead.y - here.y;
-    const length = Math.hypot(dx, dy) || 1;
-    // The perpendicular to the outline's screen direction.
-    const nx = -dy / length;
-    const ny = dx / length;
-    const at = (t: number): number =>
-      outlineCoverage(pixels, width, height, here.x + nx * t, here.y + ny * t);
-
-    // The line's crest, which is where the silhouette really landed.
-    let crest = 0;
-    let best = -1;
-    for (let t = -SEARCH; t <= SEARCH; t += STEP) {
-      const value = at(t);
-      if (value > best + 1e-6) {
-        best = value;
-        crest = t;
-      }
-    }
-
-    let total = best * STEP;
-    for (const direction of [1, -1]) {
-      for (let step = 1; step * STEP <= reach; step += 1) {
-        const value = at(crest + direction * step * STEP);
-        if (value < FLOOR) break;
-        total += value * STEP;
-      }
-    }
-    return { name, width: total };
-  });
-}
-
 interface ShotOptions {
   readonly yaw: number;
   readonly pitch: number;
@@ -615,8 +451,6 @@ interface ShotOptions {
   readonly tilt?: number;
   /** Cursor position as a viewport fraction; omitted leaves the lamp off. */
   readonly pointer?: readonly [number, number];
-  /** Draws the outline in red so its width can be measured from the pixels. */
-  readonly probeOutline?: boolean;
 }
 
 /** Applies a column-major 4x4 matrix to a point. */
@@ -639,9 +473,6 @@ async function main(): Promise<void> {
   const cardShader = await resolveShader({
     entry: `${ROOT}shaders/card.wgsl`,
   });
-  const splatShader = await resolveShader({
-    entry: `${ROOT}shaders/splat.wgsl`,
-  });
   const presentShader = await resolveShader({
     entry: `${ROOT}shaders/present.wgsl`,
   });
@@ -650,45 +481,31 @@ async function main(): Promise<void> {
   const gpu = await init();
   const api: VgpuApi = { draw, geometry, sampler, texture };
 
-  const { width, height, fx, dpr } = args;
+  const { width, height } = args;
   const aspect = width / height;
-  // Two attachments: the premultiplied picture, and the packed world normal
-  // plus silhouette mask the composite's outline reads. Multisampled, because a
-  // three pixel line dilated from a jagged silhouette is a jagged line, and
-  // `rgba8unorm` because compatibility mode will not multisample a float
-  // format.
+  // The premultiplied picture, multisampled because the card's silhouette is a
+  // hard edge against the page, and `rgba8unorm` because compatibility mode
+  // will not multisample a float format.
   const scene = target(gpu, {
     size: [width, height],
-    colors: [{ format: "rgba8unorm" }, { format: "rgba8unorm" }],
+    colors: [{ format: "rgba8unorm" }],
     depth: true,
     msaa: true,
   });
   const output = target(gpu, { size: [width, height] });
 
-  const composite = (probeOutline: boolean) => ({
+  const composite = {
     background: [...BACKGROUND] as [number, number, number],
-    outlineWidth: OUTLINE_PX * dpr,
-    outlineColor: [...(probeOutline ? PROBE_OUTLINE : OUTLINE_COLOR)] as [
-      number,
-      number,
-      number,
-    ],
-    dpr,
-    size: [width, height] as [number, number],
-    tick: 0,
-    mode: fxMode(fx),
-  });
+  };
 
   const present = effect(gpu, presentShader.wgsl, {
     set: {
       scene: scene.colors[0],
-      normalMask: scene.colors[1],
-      composite: composite(false),
+      composite,
     },
   });
 
   const presets = args.all ? PRESET_NAMES : [args.preset];
-  const splatting = fx === "splat";
 
   /** Milliseconds the last `shoot()` spent inside the frame. */
   let lastFrameMs = 0;
@@ -719,16 +536,12 @@ async function main(): Promise<void> {
       shot.pointer ? 1 : 0
     );
     card.sync();
-    present.set({ composite: composite(shot.probeOutline ?? false) });
     const started = performance.now();
     frame(gpu, (current) => {
-      // One pass: an MSAA target discards its multisample attachments at the
-      // end of a pass, so the splats have to ride along with the card.
       current.pass(
         { target: scene, clear: TRANSPARENT, clearDepth: 1 },
         (pass) => {
           pass.draw(card.draw);
-          if (splatting) pass.draw(card.splatDraw);
         }
       );
       current.pass(output, present);
@@ -742,20 +555,16 @@ async function main(): Promise<void> {
   for (const preset of presets) {
     const card = createCardScene(api, gpu, {
       shader: cardShader.wgsl,
-      splatShader: splatShader.wgsl,
       preset,
-      fx,
       designs,
       aspect,
-      splatCount: args.splats,
     });
 
     const base = (args.all ? `renders/${preset}.png` : args.out).replace(
       /\.png$/,
       ""
     );
-    const report: string[] = [`preset=${preset}`, `fx=${fx}`, `dpr=${dpr}`];
-    if (splatting) report.push(`splats=${card.splatCount}`);
+    const report: string[] = [`preset=${preset}`];
     const wanted = new Set(args.views);
     // A single view only takes the bare `--out` path when the caller named one,
     // so `--view edge` on its own can never overwrite the hero frame.
@@ -793,25 +602,6 @@ async function main(): Promise<void> {
 
       report.push(
         `under_card=${underCardLuminance(hero, width, height).toFixed(5)}`
-      );
-
-      // The line is black on black in the delivered frame, so the width is
-      // measured on the same camera with a red line.
-      const marked = await shoot(card, { ...heroShot, probeOutline: true });
-      if (args.probe) writePng(`${base}-probe.png`, marked, width, height);
-      const widths = outlineProbe(
-        marked,
-        width,
-        height,
-        heroViewProjection,
-        new Float32Array(card.model.worldMatrix),
-        OUTLINE_PX * dpr
-      );
-      report.push(
-        `outline_px=${(OUTLINE_PX * dpr).toFixed(1)}`,
-        `outline_widths=${widths
-          .map((entry) => `${entry.name}:${entry.width.toFixed(2)}`)
-          .join("/")}`
       );
 
       // The cursor light is compared against the same frame without it, at the

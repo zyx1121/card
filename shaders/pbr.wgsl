@@ -1,9 +1,8 @@
-// The card's material model, shared by the solid pass and the splat pass.
+// The card's material model.
 //
 // A WGSL module cannot declare `@group`/`@binding` resources, so this file
-// holds only the data shapes and the maths; `card.wgsl` and `splat.wgsl` own
-// the bindings and hand the values in. That is what lets a splat be lit by
-// exactly the same lobe as the surface it was sampled from.
+// holds only the data shapes and the maths; `card.wgsl` owns the bindings and
+// hands the values in.
 //
 // Lighting is a GGX specular lobe with a Burley diffuse term, three softbox
 // lights and a procedural studio environment sampled for reflections. The
@@ -375,9 +374,7 @@ export fn sparkleNormal(
 /// The whole lighting rig applied to one shaded point, returned in sRGB.
 ///
 /// `coverage` is the etch mask under the point, which shades the cursor lamp;
-/// `etchAo` is the occlusion at the etch floor. Both the solid card pass and
-/// the splat pass call this, so a splat is lit exactly like the surface it was
-/// sampled from.
+/// `etchAo` is the occlusion at the etch floor.
 export fn shadeSurface(
   surface: Surface,
   normal: vec3f,

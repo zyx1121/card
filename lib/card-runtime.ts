@@ -16,20 +16,12 @@ import { orbitControls } from "vgpu/scene";
 
 import cardShader from "@/shaders/card.wgsl";
 import presentShader from "@/shaders/present.wgsl";
-import splatShader from "@/shaders/splat.wgsl";
 
 import {
   cardCameraDistance,
   createCardScene,
   type VgpuApi,
 } from "@/lib/card-scene";
-import {
-  FX_TICK_FRAMES,
-  OUTLINE_COLOR,
-  OUTLINE_PX,
-  fxMode,
-  type CardFx,
-} from "@/lib/card-fx";
 import type { PresetName } from "@/lib/card-presets";
 import { renderCardFacesInBrowser } from "@/lib/card-texture";
 
@@ -87,9 +79,6 @@ function readCssColor(
 
 export interface CardRuntimeOptions {
   readonly preset: PresetName;
-  readonly fx: CardFx;
-  /** Outline colour in sRGB 0..1; defaults to {@link OUTLINE_COLOR}. */
-  readonly outlineColor?: readonly [number, number, number];
   /** Reports fatal startup problems, typically missing WebGPU support. */
   readonly onError?: (error: unknown) => void;
   /** Fires once the first frame has been submitted, so the canvas can fade in. */
@@ -101,9 +90,8 @@ export interface CardRuntimeOptions {
  *
  * 3D needs a depth attachment and a canvas surface has none, so the card is
  * drawn into an offscreen target and composited in a second pass. That target
- * carries two colour attachments: the premultiplied picture, and the world
- * normal plus linear depth the composite's outline reads. It is multisampled,
- * because a three pixel line dilated from a jagged silhouette is a jagged line.
+ * holds the premultiplied picture with the card's coverage in alpha, and it is
+ * multisampled, because the card's silhouette is a hard edge against the page.
  */
 export function startCard(
   canvas: HTMLCanvasElement,
@@ -132,12 +120,11 @@ export function startCard(
       // The card writes premultiplied colour with its coverage in alpha, so the
       // target clears to nothing at all and the composite lays the result over
       // the page background. That is also what makes the MSAA resolve correct.
-      // `rgba8unorm` for both, because WebGPU compatibility mode refuses to
-      // multisample a float format; the geometry buffer packs its normal into
-      // the unit range instead.
+      // `rgba8unorm`, because WebGPU compatibility mode refuses to multisample
+      // a float format.
       const scene = target(gpu, {
         size: [initialWidth, initialHeight],
-        colors: [{ format: "rgba8unorm" }, { format: "rgba8unorm" }],
+        colors: [{ format: "rgba8unorm" }],
         depth: true,
         msaa: true,
         clearColor: [0, 0, 0, 0],
@@ -147,47 +134,24 @@ export function startCard(
       const api: VgpuApi = { draw, geometry, sampler, texture };
       const card = createCardScene(api, gpu, {
         shader: cardShader,
-        splatShader,
         preset: options.preset,
-        fx: options.fx,
         designs: await renderCardFacesInBrowser(),
         aspect: initialWidth / initialHeight,
       });
 
-      const compositeValue = (
-        width: number,
-        height: number,
-        dpr: number,
-        tick: number
-      ) => ({
+      const compositeValue = () => ({
         background: [background[0], background[1], background[2]] as [
           number,
           number,
           number,
         ],
-        outlineWidth: OUTLINE_PX * dpr,
-        outlineColor: [...(options.outlineColor ?? OUTLINE_COLOR)] as [
-          number,
-          number,
-          number,
-        ],
-        dpr,
-        size: [width, height] as [number, number],
-        tick,
-        mode: fxMode(options.fx),
       });
 
       const present = effect(gpu, presentShader, {
         label: "present",
         set: {
           scene: scene.colors[0],
-          normalMask: scene.colors[1],
-          composite: compositeValue(
-            initialWidth,
-            initialHeight,
-            canvasSurface.dpr,
-            0
-          ),
+          composite: compositeValue(),
         },
       });
 
@@ -257,18 +221,11 @@ export function startCard(
       window.addEventListener("pointercancel", onPointerUp);
       canvas.addEventListener("wheel", onWheel, { passive: true });
 
-      let width = initialWidth;
-      let height = initialHeight;
-      let dpr = canvasSurface.dpr;
-
       const unsubscribeResize = canvasSurface.onResize((event) => {
-        width = event.width;
-        height = event.height;
-        dpr = event.dpr;
         scene.resize([event.width, event.height]);
-        // Binding a specific attachment does not follow a resize, so both are
+        // Binding a specific attachment does not follow a resize, so it is
         // rebound against the new generation.
-        present.set({ scene: scene.colors[0], normalMask: scene.colors[1] });
+        present.set({ scene: scene.colors[0] });
         card.setAspect(event.width / event.height);
       });
 
@@ -287,9 +244,7 @@ export function startCard(
       stopThemeWatch = () => observer.disconnect();
 
       const time = clock(gpu);
-      const splatting = options.fx === "splat";
       let ready = false;
-      let frames = 0;
       loop = frameLoop(gpu, (frame) => {
         const delta = time.deltaTime;
 
@@ -334,20 +289,13 @@ export function startCard(
         const spinning =
           introDone && !pointerDown && sinceRelease >= RESUME_DELAY;
         card.animate(time.time, spinning ? 1 : 0);
-        // The grain breathes on a slow counter rather than every frame, so it
-        // reads as alive instead of as noise.
-        frames += 1;
-        const tick = Math.floor(frames / FX_TICK_FRAMES);
-        card.setTick(tick);
         card.sync();
-        present.set({ composite: compositeValue(width, height, dpr, tick) });
+        // The background token can change under the theme watcher, so the
+        // composite's clear colour is uploaded every frame.
+        present.set({ composite: compositeValue() });
 
-        // One pass, not two: an MSAA target discards its multisample
-        // attachments at the end of a pass, so a second pass with `clear:
-        // false` would lose both the card and the depth it has to test against.
         frame.pass({ target: scene, clear: true, clearDepth: 1 }, (pass) => {
           pass.draw(card.draw);
-          if (splatting) pass.draw(card.splatDraw);
         });
         frame.pass(canvasSurface, present);
 

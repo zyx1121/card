@@ -4,19 +4,14 @@
 // texture, whose alpha is the etch mask: 1 where the laser has burned the white
 // ceramic coating away and left bare titanium, 0 where the coating is intact.
 // The milled rim is shaded from its own albedo, metalness and roughness. The
-// material model itself lives in `pbr.wgsl`, which `splat.wgsl` imports too.
+// material model itself lives in `pbr.wgsl`.
 //
 // A fourth light follows the cursor: a soft point light on a plane between the
 // camera and the card. It is off (`pointer.intensity` 0) unless the page or the
 // render script supplies a pointer.
 //
-// The pass writes two colour attachments. Attachment 0 is the premultiplied
-// shaded colour, so its alpha is the card's coverage and an MSAA resolve stays
-// linear. Attachment 1 is the geometry buffer the composite's outline reads:
-// the world normal packed into the unit range in xyz, and the card's own
-// silhouette mask in w. The mask lives here rather than in attachment 0's alpha
-// because the splat pass blends over that one and would smear the silhouette
-// the line has to follow; nothing but this pass ever writes attachment 1.
+// The pass writes premultiplied shaded colour, so its alpha is the card's
+// coverage and an MSAA resolve of a half covered pixel stays linear.
 
 import {
   Material,
@@ -42,13 +37,6 @@ struct Model {
   matrix: mat4x4f,
 }
 
-// How much of its own shading the solid card keeps. `fx=splat` drops it to
-// `CARD_SOLID_MIX` so the point cloud drawn over it carries the look; every
-// other mode leaves it at 1.
-struct Style {
-  solidMix: f32,
-}
-
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> model: Model;
 @group(0) @binding(2) var<uniform> material: Material;
@@ -56,7 +44,6 @@ struct Style {
 @group(0) @binding(4) var backDesign: texture_2d<f32>;
 @group(0) @binding(5) var designSampler: sampler;
 @group(0) @binding(6) var<uniform> pointer: Pointer;
-@group(0) @binding(7) var<uniform> style: Style;
 
 struct VertexOut {
   @builtin(position) position: vec4f,
@@ -67,12 +54,6 @@ struct VertexOut {
   // default `first` sampling for flat vertex outputs.
   @location(3) @interpolate(flat, either) face: u32,
   @location(4) tangent: vec3f,
-}
-
-// Attachment 0 is the picture, attachment 1 the outline's geometry buffer.
-struct CardOut {
-  @location(0) color: vec4f,
-  @location(1) normalMask: vec4f,
 }
 
 @vertex
@@ -95,7 +76,7 @@ fn vs_main(
 }
 
 @fragment
-fn fs_main(input: VertexOut) -> CardOut {
+fn fs_main(input: VertexOut) -> @location(0) vec4f {
   // The etch mask is read at the centre and one step to each side so its
   // gradient can drive the bevel. Every sample sits outside any branch so the
   // mip derivatives stay uniform across the quad.
@@ -194,19 +175,7 @@ fn fs_main(input: VertexOut) -> CardOut {
     coverage, etchAo, material.exposure,
   );
 
-  // `fx=splat` sends the solid card backwards: desaturated and dimmed, so the
-  // point cloud over it reads as the card rather than as a texture on one.
-  let luma = dot(shaded, vec3f(0.2126, 0.7152, 0.0722));
-  let receded = mix(vec3f(luma), shaded, 0.4) * 0.8;
-  let body = mix(receded, shaded, clamp(style.solidMix, 0.0, 1.0));
-
-  var out: CardOut;
   // Premultiplied, with the coverage in alpha: the composite lays this over the
   // page background and an MSAA resolve of it stays correct.
-  out.color = vec4f(body, 1.0);
-  // Packed into the unit range because compatibility mode refuses to
-  // multisample a float format, and 8 bits of normal is about half a degree,
-  // which is nothing against a crease the line is looking for.
-  out.normalMask = vec4f(geometricNormal * 0.5 + vec3f(0.5), 1.0);
-  return out;
+  return vec4f(shaded, 1.0);
 }

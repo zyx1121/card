@@ -1,4 +1,4 @@
-import type { Draw, Geometry, Gpu, ShaderSource, Texture } from "vgpu";
+import type { Draw, Gpu, ShaderSource, Texture } from "vgpu";
 import {
   group,
   perspectiveCamera,
@@ -6,16 +6,8 @@ import {
   type SceneNode,
 } from "vgpu/scene";
 
-import {
-  SPLAT_COUNT,
-  SPLAT_LIFT,
-  SPLAT_SIZE,
-  solidMix,
-  type CardFx,
-} from "@/lib/card-fx";
 import { cardGeometryOptions } from "@/lib/card-geometry";
 import { cardMaterial, type PresetName } from "@/lib/card-presets";
-import { splatGeometryOptions } from "@/lib/card-splats";
 import {
   CARD_HEIGHT,
   CARD_WIDTH,
@@ -66,14 +58,9 @@ export type ScenePoint = readonly [number, number, number];
 
 export interface CardSceneOptions {
   readonly shader: string | ShaderSource;
-  /** `shaders/splat.wgsl`, for the `fx=splat` point cloud. */
-  readonly splatShader: string | ShaderSource;
   readonly preset: PresetName;
-  readonly fx: CardFx;
   readonly designs: Record<CardSide, Uint8Array>;
   readonly aspect: number;
-  /** Splats in the cloud; the render script lowers it on slow adapters. */
-  readonly splatCount?: number;
   /** Initial orbit pose, the hero three-quarter view by default. */
   readonly yaw?: number;
   readonly pitch?: number;
@@ -100,21 +87,14 @@ function clamp01(value: number): number {
 
 export interface CardScene {
   readonly draw: Draw;
-  /** The point cloud, drawn over the solid card when `fx=splat`. */
-  readonly splatDraw: Draw;
-  readonly splatCount: number;
   readonly camera: PerspectiveCamera;
   readonly model: SceneNode;
   /** Advances the idle spin; `amount` fades it out while the user is dragging. */
   animate(time: number, amount: number): void;
-  /** Uploads camera, model, pointer and splat state for the current frame. */
+  /** Uploads camera, model and pointer state for the current frame. */
   sync(): void;
   setAspect(aspect: number): void;
   setPreset(preset: PresetName): void;
-  /** Switches the grain variant, which is what dims the solid card. */
-  setFx(fx: CardFx): void;
-  /** Advances the splat twinkle. One tick every few frames, not every frame. */
-  setTick(tick: number): void;
   /** Moves the cursor light; `intensity` 0 switches it off entirely. */
   setPointer(position: ScenePoint, intensity: number): void;
   /**
@@ -130,9 +110,7 @@ export interface CardScene {
  *
  * vgpu 0.5.0 has no scene renderer, so this is the low-level path: a custom
  * geometry with named attributes plus our own vertex and fragment stages, with
- * `perspectiveCamera` only supplying the view-projection matrix. The card pass
- * writes two colour attachments, the picture and the outline's geometry buffer,
- * and the splat pass blends over it without touching the second one.
+ * `perspectiveCamera` only supplying the view-projection matrix.
  */
 export function createCardScene(
   api: VgpuApi,
@@ -140,11 +118,6 @@ export function createCardScene(
   options: CardSceneOptions
 ): CardScene {
   const geometry = api.geometry(gpu, cardGeometryOptions());
-  const splatCount = options.splatCount ?? SPLAT_COUNT;
-  const splatGeometry: Geometry = api.geometry(
-    gpu,
-    splatGeometryOptions(splatCount)
-  );
 
   const designSampler = api.sampler(gpu, {
     magFilter: "linear",
@@ -156,7 +129,6 @@ export function createCardScene(
   });
 
   let aspect = options.aspect;
-  let fx = options.fx;
 
   const textures: Texture[] = [];
   const design = (side: CardSide, label: string): Texture => {
@@ -191,8 +163,6 @@ export function createCardScene(
     intensity: 0,
   };
 
-  const splat = { size: SPLAT_SIZE, tick: 0, lift: SPLAT_LIFT };
-
   const shared = {
     material: cardMaterial(options.preset),
     frontDesign,
@@ -205,20 +175,6 @@ export function createCardScene(
     position: camera.worldPosition,
   });
 
-  /**
-   * The camera basis in world space, which the splat pass needs to face its
-   * quads at the viewer. The view matrix maps world to camera space, so the
-   * rows of its rotation block are exactly that basis.
-   */
-  const splatCameraValue = () => {
-    const view = camera.view;
-    return {
-      ...cameraValue(),
-      right: [view[0], view[4], view[8]] as [number, number, number],
-      up: [view[1], view[5], view[9]] as [number, number, number],
-    };
-  };
-
   const draw = api.draw(gpu, {
     label: "card",
     shader: options.shader,
@@ -230,33 +186,6 @@ export function createCardScene(
       model: { matrix: model.worldMatrix },
       ...shared,
       pointer,
-      style: { solidMix: solidMix(fx) },
-    },
-  });
-
-  // The cloud is premultiplied over the solid card and never writes depth: the
-  // quads overlap each other, and sorting a hundred thousand of them per frame
-  // is not what this is for.
-  //
-  // It also has to leave the outline's geometry buffer alone, so the line keeps
-  // reading the solid card's own silhouette and crease. A per-attachment write
-  // mask would be the obvious way to say that, but WebGPU compatibility mode
-  // requires every colour target to share one blend state and one write mask.
-  // Instead the shader writes a fully transparent black to that attachment, and
-  // premultiplied blending leaves the destination exactly as it found it.
-  const splatDraw = api.draw(gpu, {
-    label: "card-splats",
-    shader: options.splatShader,
-    geometry: splatGeometry,
-    cull: "none",
-    blend: "premultiplied",
-    depth: { write: false, compare: "less-equal" },
-    set: {
-      camera: splatCameraValue(),
-      model: { matrix: model.worldMatrix },
-      ...shared,
-      pointer,
-      splat,
     },
   });
 
@@ -282,8 +211,6 @@ export function createCardScene(
 
   return {
     draw,
-    splatDraw,
-    splatCount,
     camera,
     model,
     animate(time: number, amount: number): void {
@@ -293,13 +220,10 @@ export function createCardScene(
       model.set({ rotation: [0, spinYaw, 0] });
     },
     sync(): void {
-      const matrix = { matrix: model.worldMatrix };
-      draw.set({ camera: cameraValue(), model: matrix, pointer });
-      splatDraw.set({
-        camera: splatCameraValue(),
-        model: matrix,
+      draw.set({
+        camera: cameraValue(),
+        model: { matrix: model.worldMatrix },
         pointer,
-        splat,
       });
     },
     setAspect(next: number): void {
@@ -307,16 +231,7 @@ export function createCardScene(
       camera.set({ aspect: next });
     },
     setPreset(preset: PresetName): void {
-      const material = cardMaterial(preset);
-      draw.set({ material });
-      splatDraw.set({ material });
-    },
-    setFx(next: CardFx): void {
-      fx = next;
-      draw.set({ style: { solidMix: solidMix(fx) } });
-    },
-    setTick(tick: number): void {
-      splat.tick = tick;
+      draw.set({ material: cardMaterial(preset) });
     },
     setPointer(position: ScenePoint, intensity: number): void {
       pointer.position[0] = position[0];
@@ -349,7 +264,6 @@ export function createCardScene(
     },
     destroy(): void {
       geometry.destroy();
-      splatGeometry.destroy();
       for (const item of textures) item.destroy();
     },
   };
