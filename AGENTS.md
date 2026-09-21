@@ -30,17 +30,58 @@ Report the mismatch instead of inventing one.
   The card uses the low-level path: `geometry(gpu, { buffers, indices })` with
   named attributes, `draw(gpu, { shader, geometry })`, and our own vertex and
   fragment stages in `shaders/card.wgsl`.
-- 3D needs a depth attachment and a canvas surface has none, so rendering is two
-  passes: an offscreen `target(gpu, { size, depth: true })`, then a full-screen
-  composite onto the surface.
+- 3D needs a depth attachment and a canvas surface has none, so rendering is
+  three passes: the mirrored card into a half-resolution `reflection` target,
+  the card itself into a full-resolution `scene` target, then one full-screen
+  composite onto the surface. Both offscreen targets are
+  `target(gpu, { size, depth: true })`.
 - There is no mip generation and no texture upload helper. `lib/design-texture.ts`
   builds the mip chain on the CPU and writes every level through
-  `gpu.gpu.queue.writeTexture`.
+  `gpu.gpu.queue.writeTexture`, and the floor reflection is blurred with a fixed
+  9-tap cross at half resolution rather than by sampling a lower mip.
 - WebGPU compatibility mode rejects the default `first` sampling for flat vertex
   outputs, so the `face` varying is declared `@interpolate(flat, either)`.
 - `Path2D` exists in both the browser and `@napi-rs/canvas`, so the zyx mark is
   drawn from one SVG path string in both. The constructor is injected rather than
   imported, because `lib/card-texture.ts` is bundled for the browser too.
+
+## The three passes and their uniforms
+
+`shaders/card.wgsl` is bound twice, by two `draw()`s that share one geometry and
+one pair of design textures, and `shaders/present.wgsl` reads both targets.
+
+| Pass       | Target                                                                      | Draw                  | What is different                                                                                                                         |
+| ---------- | --------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| reflection | `reflection`, half resolution, depth, cleared to `[0, 0, 0, 0]`             | `card.reflectionDraw` | `model.matrix` is mirrored about the floor plane, so `frontFace: "cw"` because a mirror flips the winding; `reflection.isReflection` is 1 |
+| scene      | `scene`, full resolution, depth, cleared to the background with **alpha 0** | `card.draw`           | `reflection.isReflection` is 0                                                                                                            |
+| present    | the canvas surface, or an offscreen target in the render script             | `present` effect      | samples `scene` and `reflection`                                                                                                          |
+
+Two uniforms were added to `card.wgsl`:
+
+- `pointer: { position: vec3f, intensity: f32 }` is the cursor light, a fourth
+  light hanging `POINTER_PLANE_OFFSET` (120 mm) in front of the card, on a plane
+  perpendicular to the view direction. `intensity` 0 removes it entirely, which
+  is the default and what every existing probe sees. Intersecting the cursor ray
+  with that plane, as a literal reading would, barely moves the lamp: at hero
+  framing the plane is only a third of the way out from the eye, so the whole
+  viewport maps to a couple of centimetres. `pointerPlanePoint()` therefore
+  hangs the lamp on that plane directly in front of the point the cursor is
+  over. The lamp is shaded by `POINTER_ETCH_SHADE` where the etch mask covers
+  the surface: the ACES curve is nearly flat at the coating's luminance and
+  steep at the etch floor, so a light that hits both equally flattens the marks.
+- `reflection: { floorY, fade, strength, isReflection }` drives the mirrored
+  pass. The floor is at `CARD_FLOOR_Y`, `CARD_FLOAT_HEIGHT` (6 mm) below the
+  card's bottom edge. The mirrored fragment output is multiplied by a quadratic
+  fade over `fade` millimetres below the floor line and by `strength` (0.35),
+  and is written **premultiplied** so `present.wgsl` can blur it without
+  dragging the cleared background into its edges.
+
+`present.wgsl` gained a `reflection` texture binding and
+`composite: { floorLine, blur }`. `floorLine` is the texture-space v of the
+floor line, from `card.floorLine()`, and the blur radius grows from a quarter of
+`blur` at the floor line to all of it at the bottom of the frame. The scene
+target's alpha is the card's coverage, which is why it clears with alpha 0: the
+composite is `scene` over (`reflection` over the cleared background).
 
 ## How the titanium is built
 
@@ -73,11 +114,32 @@ bun run lint && bunx tsc --noEmit && bun run build
 and instances them with fontTools through `uvx`). It shoots a hero, a back and a
 rim macro per preset and prints the silhouette aspect, the etch-versus-coating
 contrast, the bare-face luminance gradient, the highlight aspect ratio (the
-anisotropy check) and the rim-versus-face step, so a render can be judged
-without a GPU. `--view hero|back|edge` shoots one frame.
+anisotropy check), the rim-versus-face step and the floor reflection's mean and
+per-row luminance, so a render can be judged without a GPU.
+`--view hero|back|edge` shoots one frame.
 
-The titanium preset is held to: `etch_contrast >= 0.35`, `face_gradient` between
-0.05 and 0.25, and `highlight_ratio >= 1.8`.
+Three flags exist for the effects:
+
+- `--pointer x,y` lights the cursor lamp, `x` and `y` being viewport fractions
+  from the top-left, so `0.62,0.45` is right of centre and a little high. It
+  adds `pointer_lit`, `pointer_unlit`, `pointer_delta` and `pointer_peak`,
+  measured on a 49 x 49 patch at that pixel against the same frame with the lamp
+  off. Without the flag the lamp stays dark, so the existing probes are
+  untouched.
+- `--pitch <degrees>` overrides the hero pitch. `--pitch 2` drops the camera
+  almost into the card's plane, which is the clearest look at the reflection.
+- The silhouette frame and the rim macro are shot with the reflection pass
+  skipped, because on a black background the reflection would otherwise count
+  as card in the silhouette bounds.
+
+The titanium preset is held to: `etch_contrast >= 0.35` (with or without the
+cursor lamp over the marks), `face_gradient` between 0.05 and 0.25,
+`highlight_ratio >= 1.8`, `reflection_mean` between 0.03 and 0.18 with
+`reflection_fading=true`, and `pointer_delta >= 0.08` with `pointer_peak` at
+most 0.95.
+
+The render script's background is black with an alpha of 0, matching the site's
+forced-dark theme and the coverage alpha the composite needs.
 
 ## Layout
 
@@ -90,5 +152,11 @@ The titanium preset is held to: `etch_contrast >= 0.35`, `face_gradient` between
   `etch` is the laser recess and `spotGloss` is the UV varnish: two readings of the
   same mask, and no preset uses both.
 - `lib/card-scene.ts` geometry, textures, camera and the draw, shared by both entry points.
-- `lib/card-runtime.ts` browser-only: surface, orbit controls, idle sway, frame loop.
+- `lib/card-runtime.ts` browser-only: surface, the three targets, orbit
+  controls, the cursor light's easing and idle timeout, the one-shot intro and
+  the frame loop. The intro runs for 1.6 s on a cubic ease-out from
+  `distance x 1.8`, yaw -110 deg and pitch 20 deg to the hero pose, driven
+  through `controls.set()` (which jumps state and goal), with the spin held; a
+  `pointerdown` skips it. `onReady` fires after the first submitted frame so
+  `components/card-canvas.tsx` can fade the canvas in over 0.5 s.
 - `shaders/card.wgsl` PBR shading; `shaders/present.wgsl` the composite pass.

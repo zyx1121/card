@@ -23,6 +23,9 @@ Handing someone a link is easy; handing them something that feels like an object
 - **Hold a real card**: true millimetre dimensions, a 3.18 mm ID-1 corner radius and a 0.76 mm milled rim you can rake the light across.
 - **Etched, not printed**: the design texture's alpha is an etch mask, so every mark is recessed bare titanium with its own roughness, metalness and hairline wall.
 - **Brushed metal, properly**: an anisotropic GGX lobe along the card's long axis, with the studio environment stretched to match, so softboxes smear into horizontal bands.
+- **Lit by your cursor**: a fourth light hangs 120 mm in front of the card and follows the pointer, so the coating carries a soft warm pool that glides instead of a fixed highlight.
+- **Standing on nothing**: the card floats 6 mm above an invisible floor and casts a blurred, downward-fading mirror image of itself, drawn as a second mirrored pass at half resolution.
+- **Arrives, does not appear**: on load the card swings in from edge-on over 1.6 s while the canvas fades up, then settles into its slow turn. Touch it and the intro gets out of the way.
 - **Compare four finishes**: `?preset=titanium` is the default; `?preset=paper`, `?preset=soft-touch` and `?preset=gloss` swap the whole material back to printed stock.
 - **Prove the render without a GPU**: a headless script renders every preset to PNG and asserts on the pixels, so a shader change cannot quietly break the look.
 
@@ -66,8 +69,17 @@ bun run render       # headless PNGs into renders/, plus pixel assertions
 `bun run render` shoots a hero, a back and a rim macro per preset. It prints the
 measured silhouette aspect, the etch-versus-coating contrast, the luminance
 gradient across the bare face, the aspect ratio of the brightest highlight
-(which is how the anisotropy is checked) and the rim-versus-face step. A single
-frame is available with `--view hero|back|edge`.
+(which is how the anisotropy is checked), the rim-versus-face step and the floor
+reflection's mean and per-row luminance. A single frame is available with
+`--view hero|back|edge`.
+
+Two more flags cover the interactive effects, which a still frame cannot show on
+its own:
+
+```bash
+bun run scripts/render.ts --view hero --pointer 0.62,0.45   # cursor light on, at 62% across and 45% down
+bun run scripts/render.ts --view hero --pitch 2             # camera almost in the card's plane
+```
 
 ## Deploy
 
