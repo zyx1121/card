@@ -42,8 +42,8 @@ export const CARD_HERO_YAW = (-22 * Math.PI) / 180;
 /** Hero pitch, just above the card's plane. Radians. */
 export const CARD_HERO_PITCH = (8 * Math.PI) / 180;
 
-/** Idle spin speed in radians per second: one full turn every 9 seconds. */
-const SPIN_SPEED = (2 * Math.PI) / 9;
+/** Idle spin speed in radians per second: one full turn every 16 seconds. */
+const SPIN_SPEED = (2 * Math.PI) / 16;
 
 export interface CardSceneOptions {
   readonly shader: string | ShaderSource;
