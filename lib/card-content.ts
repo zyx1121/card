@@ -102,7 +102,7 @@ export const cardContent: {
         weight: 400,
       },
       {
-        text: "yongxiang.zhan@outlook.com",
+        text: "mail@zyx.tw",
         x: CARD_MARGIN,
         baseline: BACK_BASELINE,
         capHeight: 2.2,

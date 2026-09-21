@@ -36,8 +36,8 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <body className="bg-background h-full">
         <ThemeProvider
           attribute="class"
-          defaultTheme="light"
-          enableSystem
+          defaultTheme="dark"
+          forcedTheme="dark"
           disableTransitionOnChange
         >
           {children}
