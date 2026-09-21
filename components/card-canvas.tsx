@@ -6,7 +6,17 @@ import { startCard } from "@/lib/card-runtime";
 import type { CardFx } from "@/lib/card-fx";
 import type { PresetName } from "@/lib/card-presets";
 
-export function CardCanvas({ preset, fx }: { preset: PresetName; fx: CardFx }) {
+export function CardCanvas({
+  preset,
+  fx,
+  outline,
+  background,
+}: {
+  preset: PresetName;
+  fx: CardFx;
+  outline: [number, number, number];
+  background?: string;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [failed, setFailed] = useState(false);
   const [ready, setReady] = useState(false);
@@ -24,17 +34,30 @@ export function CardCanvas({ preset, fx }: { preset: PresetName; fx: CardFx }) {
     // If the first frame never arrives the canvas must not stay invisible, so
     // it fades in regardless after three seconds.
     const fallback = window.setTimeout(handleReady, 3000);
+    // `?bg=` overrides the theme token; the runtime watches the style attribute
+    // and re-reads the clear colour.
+    const root = document.documentElement;
+    const previousBackground = root.style.getPropertyValue("--background");
+    if (background) root.style.setProperty("--background", background);
     const stop = startCard(canvas, {
       preset,
       fx,
+      outlineColor: outline,
       onError: handleError,
       onReady: handleReady,
     });
     return () => {
       window.clearTimeout(fallback);
       stop();
+      if (background) {
+        if (previousBackground) {
+          root.style.setProperty("--background", previousBackground);
+        } else {
+          root.style.removeProperty("--background");
+        }
+      }
     };
-  }, [preset, fx, handleError, handleReady]);
+  }, [preset, fx, outline, background, handleError, handleReady]);
 
   if (failed) {
     return <p className="text-muted-foreground text-sm">WebGPU required</p>;

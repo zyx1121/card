@@ -88,6 +88,8 @@ function readCssColor(
 export interface CardRuntimeOptions {
   readonly preset: PresetName;
   readonly fx: CardFx;
+  /** Outline colour in sRGB 0..1; defaults to {@link OUTLINE_COLOR}. */
+  readonly outlineColor?: readonly [number, number, number];
   /** Reports fatal startup problems, typically missing WebGPU support. */
   readonly onError?: (error: unknown) => void;
   /** Fires once the first frame has been submitted, so the canvas can fade in. */
@@ -164,7 +166,11 @@ export function startCard(
           number,
         ],
         outlineWidth: OUTLINE_PX * dpr,
-        outlineColor: OUTLINE_COLOR as unknown as [number, number, number],
+        outlineColor: [...(options.outlineColor ?? OUTLINE_COLOR)] as [
+          number,
+          number,
+          number,
+        ],
         dpr,
         size: [width, height] as [number, number],
         tick,

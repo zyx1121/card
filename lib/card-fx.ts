@@ -34,8 +34,54 @@ export function resolveFx(value: string | string[] | undefined): CardFx {
  */
 export const OUTLINE_PX = 3;
 
-/** Outline colour. Pure black, which is what a drawn line is. */
-export const OUTLINE_COLOR: readonly [number, number, number] = [0, 0, 0];
+/**
+ * Default outline colour, sRGB 0..1. White: the page background is black, so
+ * a black line would vanish into it. `?outline=<hex>` overrides it.
+ */
+export const OUTLINE_COLOR: readonly [number, number, number] = [1, 1, 1];
+
+/** Parses `rgb` / `rrggbb` (optional leading `#`) into sRGB 0..1. */
+export function parseHexColor(
+  value: string | undefined
+): [number, number, number] | undefined {
+  if (!value) return undefined;
+  const hex = value.replace(/^#/, "");
+  const full =
+    hex.length === 3
+      ? hex
+          .split("")
+          .map((c) => c + c)
+          .join("")
+      : hex;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return undefined;
+  const n = parseInt(full, 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+
+/** Reads `?outline=<hex>`, falling back to {@link OUTLINE_COLOR}. */
+export function resolveOutline(
+  value: string | string[] | undefined
+): [number, number, number] {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return parseHexColor(raw) ?? [...OUTLINE_COLOR];
+}
+
+/** Reads `?bg=<hex>` as a CSS colour string, or undefined to keep the theme. */
+export function resolveBackground(
+  value: string | string[] | undefined
+): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const parsed = parseHexColor(raw);
+  if (!parsed) return undefined;
+  const hex = parsed
+    .map((c) =>
+      Math.round(c * 255)
+        .toString(16)
+        .padStart(2, "0")
+    )
+    .join("");
+  return `#${hex}`;
+}
 
 /**
  * How much of its own shading the solid card keeps.
