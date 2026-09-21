@@ -21,12 +21,16 @@ const POINTER_RADIUS: f32 = 60.0;
 const POINTER_COLOR: vec3f = vec3f(1.0, 0.94, 0.86);
 
 /// Peak radiance of the cursor light at `intensity` 1, before falloff.
-const POINTER_GAIN: f32 = 42.0;
+///
+/// The blasted coating scatters more of the lamp than the old satin one did,
+/// so the gain is trimmed up to keep the pool as readable as it was.
+const POINTER_GAIN: f32 = 45.0;
 
-/// How much of the cursor light the etch floor loses. The lamp is near-field
-/// and nearly head-on, so the recess walls cut it far harder than they cut the
-/// distant softboxes; without that the marks wash out under the pool.
-const POINTER_ETCH_SHADE: f32 = 0.8;
+/// How much of the cursor light the marks lose. The lamp is near-field and
+/// nearly head-on, where the ACES curve is nearly flat at the coating's
+/// luminance and steep at the mark's, so a light that hits both equally
+/// flattens the marks away.
+const POINTER_MARK_SHADE: f32 = 0.8;
 
 export struct Material {
   baseColor: vec3f,
@@ -45,10 +49,10 @@ export struct Material {
   exposure: f32,
   anisotropy: f32,
   sparkle: f32,
-  etch: f32,
-  etchDepth: f32,
+  relief: f32,
+  reliefDepth: f32,
   bevel: f32,
-  etchAo: f32,
+  reliefAo: f32,
   edgeRoughness: f32,
 }
 
@@ -345,36 +349,72 @@ export fn hash21(p: vec2f) -> f32 {
   return fract((h.x + h.y) * h.x);
 }
 
-// Sandblast glitter: individual pits catching the key light. It is deliberately
-// near the resolution limit, so it is faded out once a screen pixel covers more
-// than about one pit, otherwise it would only produce aliasing.
-export fn sparkleNormal(
+/// Sandblast grit, as cells on the blank rather than in UV: the card is
+/// 90 x 54 mm, so an even grid in UV would come out as stretched streaks.
+/// 320 x 192 is 3.6 cells per millimetre, about 3 px per cell at hero framing,
+/// which is the coarsest the blast can be and still read as a fine speckle.
+const SPARKLE_CELLS: vec2f = vec2f(320.0, 192.0);
+
+/// Peak tilt of one grit facet at `strength` 1, in tangent-space units.
+const SPARKLE_TILT: f32 = 0.8;
+
+/// Peak roughness swing of one grit facet at `strength` 1.
+const SPARKLE_ROUGHNESS: f32 = 0.2;
+
+export struct Sparkle {
+  normal: vec3f,
+  /// Signed roughness offset to add to the surface, centred on zero.
+  roughness: f32,
+}
+
+/// Sandblast glitter: individual grit facets catching the key light, each with
+/// its own tilt and its own finish.
+///
+/// The speckle is faded out past about one cell per pixel, where it would only
+/// produce aliasing, but it is deliberately visible well before that: a blasted
+/// coating that resolves to a flat grey has lost the thing that makes it read as
+/// metal rather than as paint.
+export fn sparkle(
   normal: vec3f,
   tangent: vec3f,
   bitangent: vec3f,
   uv: vec2f,
   footprint: f32,
   strength: f32,
-) -> vec3f {
+) -> Sparkle {
+  var out: Sparkle;
+  out.normal = normal;
+  out.roughness = 0.0;
   if (strength <= 0.0) {
-    return normal;
+    return out;
   }
-  let cells = 700.0;
-  let fade = 1.0 - smoothstep(0.35, 1.1, footprint * cells);
+  let fade = 1.0 - smoothstep(0.7, 1.6, footprint * SPARKLE_CELLS.x);
   if (fade <= 0.0) {
-    return normal;
+    return out;
   }
-  let cell = floor(uv * cells);
+  let grid = uv * SPARKLE_CELLS;
+  let cell = floor(grid);
   let dx = hash21(cell) - 0.5;
   let dy = hash21(cell + vec2f(7.31, 3.17)) - 0.5;
-  let amount = strength * fade * 0.09;
-  return normalize(normal + tangent * dx * amount + bitangent * dy * amount);
+  let dr = hash21(cell + vec2f(1.73, 9.41)) - 0.5;
+  // Each cell holds one round pit rather than filling its square: blast grit
+  // is pitting, and a full square grid resolves into visible blocks the moment
+  // the card is looked at closely.
+  let pit = 1.0 - smoothstep(0.3, 0.62, length(fract(grid) - vec2f(0.5)));
+  let amount = strength * fade * pit * SPARKLE_TILT;
+  out.normal = normalize(normal + tangent * dx * amount + bitangent * dy * amount);
+  // A pit is a slightly different finish from the flat beside it, which is what
+  // breaks the anisotropic highlight into a band of glints instead of leaving
+  // one clean streak.
+  out.roughness = dr * strength * fade * pit * SPARKLE_ROUGHNESS;
+  return out;
 }
 
 /// The whole lighting rig applied to one shaded point, returned in sRGB.
 ///
-/// `coverage` is the etch mask under the point, which shades the cursor lamp;
-/// `etchAo` is the occlusion at the etch floor.
+/// `coverage` is the mark mask under the point, which shades the cursor lamp;
+/// `occlusion` is the relief's ambient term: below 1 in a recess or at the foot
+/// of a raised mark, above 1 on a raised mark's top.
 export fn shadeSurface(
   surface: Surface,
   normal: vec3f,
@@ -385,7 +425,7 @@ export fn shadeSurface(
   cameraPosition: vec3f,
   pointer: Pointer,
   coverage: f32,
-  etchAo: f32,
+  occlusion: f32,
   exposure: f32,
 ) -> vec3f {
   let view = normalize(cameraPosition - worldPosition);
@@ -417,7 +457,7 @@ export fn shadeSurface(
     color += shadeLight(
       toPointer,
       POINTER_COLOR * POINTER_GAIN * pointer.intensity * falloff * falloff *
-        (1.0 - coverage * POINTER_ETCH_SHADE),
+        (1.0 - coverage * POINTER_MARK_SHADE),
       normal, view, geometricNormal, tangent, bitangent, surface, f0,
     );
   }
@@ -427,9 +467,9 @@ export fn shadeSurface(
   let reflectionDirection = reflect(-view, normal);
   let irradiance = studio(normal, 1.0);
   let kd = (vec3f(1.0) - fresnelSchlick(nDotV, f0)) * (1.0 - surface.metallic);
-  color += kd * surface.albedo * irradiance * 0.32 * etchAo;
+  color += kd * surface.albedo * irradiance * 0.32 * occlusion;
   color += environment(reflectionDirection, surface.roughness, tangent, surface.anisotropy) *
-    envBrdfApprox(f0, surface.roughness, nDotV) * etchAo;
+    envBrdfApprox(f0, surface.roughness, nDotV) * occlusion;
 
   if (surface.clearcoat > 0.0) {
     let ccReflection = reflect(-view, geometricNormal);

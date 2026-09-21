@@ -2,9 +2,9 @@
  * Material presets. Pick one with the `?preset=` search param.
  *
  * `titanium` is the card as designed: a sandblasted white ceramic coating over
- * titanium, with every mark laser-etched down to bare metal. The other three
- * are the printed-stock studies that came before it and are kept reachable for
- * comparison.
+ * titanium, with every mark standing proud of it in bare metal. The other
+ * three are the printed-stock studies that came before it and are kept
+ * reachable for comparison.
  */
 
 export type PresetName = "titanium" | "paper" | "soft-touch" | "gloss";
@@ -27,7 +27,7 @@ export interface CardMaterial {
   readonly clearcoatRoughness: number;
   /** Retroreflective fibre sheen of a printed stock. */
   readonly sheen: number;
-  /** Mark albedo, linear RGB: printed ink, or bare metal under an etch. */
+  /** Mark albedo, linear RGB: printed ink, or the relief's bare metal. */
   readonly inkColor: readonly [number, number, number];
   readonly inkRoughness: number;
   readonly inkMetallic: number;
@@ -40,14 +40,18 @@ export interface CardMaterial {
   readonly anisotropy: number;
   /** High-frequency glitter from the sandblast. */
   readonly sparkle: number;
-  /** How much the mark mask reads as a laser etch rather than printed ink. */
-  readonly etch: number;
-  /** Depth of the etch in millimetres, used to scale the edge bevel. */
-  readonly etchDepth: number;
+  /** How much the mark mask reads as worked metal rather than printed ink. */
+  readonly relief: number;
+  /**
+   * Height of the relief in millimetres, signed: negative is etched into the
+   * coating, positive is embossed proud of it. It scales the edge bevel and
+   * decides which way that bevel faces.
+   */
+  readonly reliefDepth: number;
   /** Strength of the bevel rolled into the mask edge. */
   readonly bevel: number;
-  /** Ambient occlusion at the etch floor. */
-  readonly etchAo: number;
+  /** Ambient occlusion at the relief: an etch's floor, or an emboss's foot. */
+  readonly reliefAo: number;
   /** Rim albedo, linear RGB. */
   readonly edgeColor: readonly [number, number, number];
   readonly edgeMetallic: number;
@@ -70,14 +74,17 @@ const PRESETS: Record<PresetName, CardMaterial> = {
     inkRoughness: 0.45,
     inkMetallic: 1,
     spotGloss: 0,
-    grain: 0.22,
+    // A coarse blast, not a satin: at hero scale the speckle has to be visible
+    // per pixel or the face reads as white paint.
+    grain: 0.55,
     exposure: 1.46,
     anisotropy: 0.4,
-    sparkle: 0.4,
-    etch: 1,
-    etchDepth: 0.03,
+    sparkle: 0.55,
+    relief: 1,
+    // Embossed: the marks stand 0.06 mm proud of the coating.
+    reliefDepth: 0.06,
     bevel: 1,
-    etchAo: 0.22,
+    reliefAo: 0.22,
     // The milled rim keeps its polish, so it catches the rim light.
     edgeColor: [0.6, 0.61, 0.63],
     edgeMetallic: 1,
@@ -98,10 +105,10 @@ const PRESETS: Record<PresetName, CardMaterial> = {
     exposure: 0.95,
     anisotropy: 0,
     sparkle: 0,
-    etch: 0,
-    etchDepth: 0,
+    relief: 0,
+    reliefDepth: 0,
     bevel: 0,
-    etchAo: 0,
+    reliefAo: 0,
     edgeColor: [0.6696, 0.6552, 0.6264],
     edgeMetallic: 0,
     edgeRoughness: 1,
@@ -121,10 +128,10 @@ const PRESETS: Record<PresetName, CardMaterial> = {
     exposure: 1.1,
     anisotropy: 0,
     sparkle: 0,
-    etch: 0,
-    etchDepth: 0,
+    relief: 0,
+    reliefDepth: 0,
     bevel: 0,
-    etchAo: 0,
+    reliefAo: 0,
     edgeColor: [0.01584, 0.01584, 0.01872],
     edgeMetallic: 0,
     edgeRoughness: 0.81,
@@ -144,10 +151,10 @@ const PRESETS: Record<PresetName, CardMaterial> = {
     exposure: 0.78,
     anisotropy: 0,
     sparkle: 0,
-    etch: 0,
-    etchDepth: 0,
+    relief: 0,
+    reliefDepth: 0,
     bevel: 0,
-    etchAo: 0,
+    reliefAo: 0,
     edgeColor: [0.684, 0.684, 0.684],
     edgeMetallic: 0,
     edgeRoughness: 0.5225,

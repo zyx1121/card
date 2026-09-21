@@ -9,19 +9,20 @@
 
 # card
 
-> A laser-etched white titanium business card you can pick up, turn over and hold to the light.
+> An embossed white titanium business card you can pick up, turn over and hold to the light.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#license)
 
-Handing someone a link is easy; handing them something that feels like an object is not. A metal card has weight, a milled rim, a blasted coating that catches the light in a band rather than a point, and none of that survives a flat PNG. This page renders the real thing instead: 90 x 54 x 0.76 mm of titanium under a white ceramic coating, every mark burned through to bare metal, lit in a studio, running on your GPU.
+Handing someone a link is easy; handing them something that feels like an object is not. A metal card has weight, a milled rim, a blasted coating that catches the light in a band rather than a point, and none of that survives a flat PNG. This page renders the real thing instead: 90 x 54 x 0.76 mm of titanium under a white ceramic coating, every mark standing 0.06 mm proud of it in bare metal, lit in a studio, running on your GPU.
 
-![The card, white titanium with a laser-etched mark](docs/hero.png)
-<sub>The default `titanium` preset: sandblasted white coating, brushed along the long axis, etched down to bare metal.</sub>
+![The card, white titanium with an embossed mark](docs/hero.png)
+<sub>The default `titanium` preset: sandblasted white coating, brushed along the long axis, marks raised in bare metal.</sub>
 
 ## Features
 
 - **Hold a real card**: true millimetre dimensions, a 3.18 mm ID-1 corner radius and a 0.76 mm milled rim you can rake the light across.
-- **Etched, not printed**: the design texture's alpha is an etch mask, so every mark is recessed bare titanium with its own roughness, metalness and hairline wall.
+- **Raised, not printed**: the design texture's alpha is a mark mask, so every mark is bare titanium standing proud of the coating, with its own roughness, metalness, lit top edge and contact shadow. `reliefDepth` is signed, so the same marks can be etched back into the coating by flipping it negative.
+- **Turns with the window**: a viewport taller than it is wide rolls the card a quarter turn clockwise and reframes it to 85% of the width, easing over 0.4 s rather than snapping, while the idle spin stays a horizontal turn.
 - **Brushed metal, properly**: an anisotropic GGX lobe along the card's long axis, with the studio environment stretched to match, so softboxes smear into horizontal bands.
 - **Lit by your cursor**: a fourth light hangs 120 mm in front of the card and follows the pointer, so the coating carries a soft warm pool that glides instead of a fixed highlight.
 - **Arrives, does not appear**: on load the card swings in from edge-on over 1.6 s while the canvas fades up, then settles into its slow turn. Touch it and the intro gets out of the way.
@@ -50,7 +51,7 @@ the card to orbit it. No environment variables, no backend.
 
 ## Editing the card
 
-Everything etched into the card lives in [`lib/card-content.ts`](lib/card-content.ts),
+Everything marked on the card lives in [`lib/card-content.ts`](lib/card-content.ts),
 positioned in millimetres on the real 90 x 54 mm face. The blank itself is
 [`CARD_DIMENSIONS`](lib/card-spec.ts) and the material presets are in
 [`lib/card-presets.ts`](lib/card-presets.ts).
@@ -66,17 +67,20 @@ bun run render       # headless PNGs into renders/, plus pixel assertions
 ```
 
 `bun run render` shoots a hero, a back and a rim macro per preset. It prints the
-measured silhouette aspect, the etch-versus-coating contrast, the luminance
-gradient across the bare face, the aspect ratio of the brightest highlight
-(which is how the anisotropy is checked), the rim-versus-face step and the mean
-luminance of the band under the card. A single frame is available with
-`--view hero|back|edge`.
+measured silhouette aspect and width, the mark-versus-coating contrast, the
+luminance gradient across the bare face, the speckle left once that gradient is
+filtered out, the aspect ratio of the brightest highlight (which is how the
+anisotropy is checked), the rim-versus-face step and the mean luminance of the
+band under the card. A single frame is available with
+`--view hero|back|edge|macro`.
 
 More flags cover what a single still frame cannot show on its own:
 
 ```bash
 bun run scripts/render.ts --view hero --yaw 70               # steep three-quarter, where the milled rim opens up
 bun run scripts/render.ts --view hero --pointer 0.62,0.45    # cursor light on, at 62% across and 45% down
+bun run scripts/render.ts --view macro                       # the name at 4x, where the raised bevel is readable
+bun run scripts/render.ts --view hero --width 900 --height 1600  # portrait, where the card rolls upright
 ```
 
 ## Deploy

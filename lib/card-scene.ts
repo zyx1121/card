@@ -46,6 +46,31 @@ export const CARD_HERO_PITCH = (8 * Math.PI) / 180;
 const SPIN_SPEED = (2 * Math.PI) / 16;
 
 /**
+ * Quarter turn the card is rolled by on a portrait viewport, in radians.
+ *
+ * Negative is clockwise on screen, so the card's top edge swings to the right:
+ * the mark ends up in the top-right corner and the name runs down the left
+ * side, which is how a card is held to be read on a phone.
+ */
+export const CARD_PORTRAIT_ROLL = -Math.PI / 2;
+
+/**
+ * Seconds the portrait roll and the matching refit take.
+ *
+ * A resize or an orientation change is a real event, not a layout glitch, so
+ * the card turns into its new framing instead of snapping.
+ */
+export const CARD_ROLL_EASE = 0.4;
+
+/**
+ * Easing rate of the roll, per second.
+ *
+ * It is a time constant, so the roll covers about 95% of the turn within
+ * {@link CARD_ROLL_EASE}.
+ */
+const ROLL_RATE = 3 / CARD_ROLL_EASE;
+
+/**
  * How far in front of the card the cursor light hangs, in millimetres.
  *
  * The light lives on a plane perpendicular to the view direction, so it tracks
@@ -66,19 +91,34 @@ export interface CardSceneOptions {
   readonly pitch?: number;
 }
 
+/** True when the canvas is taller than it is wide, where the card is rolled. */
+export function isPortrait(aspect: number): boolean {
+  return aspect < 1;
+}
+
 /**
  * Distance at which the card fills the intended share of the viewport.
  *
- * Wide viewports get about 60% of the width, narrow (phone) viewports about
- * 85%. The height is checked too so a very wide window never crops the card.
+ * Wide viewports get about 60% of the width, narrowing to about 85% as the
+ * window squares up. A portrait viewport is a different framing altogether:
+ * the card is rolled upright, so it is the 54 mm side that has to fit the
+ * width, and it is given 85% of it. Either way the other axis is checked too,
+ * so no window shape ever crops the card.
  */
 export function cardCameraDistance(aspect: number): number {
+  const span = 2 * Math.tan((CARD_FOV * Math.PI) / 360);
+  if (isPortrait(aspect)) {
+    return Math.max(
+      CARD_HEIGHT / 0.85 / (span * aspect),
+      CARD_WIDTH / 0.82 / span
+    );
+  }
   const narrow = clamp01((1.4 - aspect) / (1.4 - 0.6));
   const widthFill = 0.6 + narrow * 0.25;
-  const halfFov = (CARD_FOV * Math.PI) / 360;
-  const byWidth = CARD_WIDTH / widthFill / (2 * Math.tan(halfFov) * aspect);
-  const byHeight = CARD_HEIGHT / 0.72 / (2 * Math.tan(halfFov));
-  return Math.max(byWidth, byHeight);
+  return Math.max(
+    CARD_WIDTH / widthFill / (span * aspect),
+    CARD_HEIGHT / 0.72 / span
+  );
 }
 
 function clamp01(value: number): number {
@@ -89,11 +129,17 @@ export interface CardScene {
   readonly draw: Draw;
   readonly camera: PerspectiveCamera;
   readonly model: SceneNode;
-  /** Advances the idle spin; `amount` fades it out while the user is dragging. */
+  /**
+   * Advances the idle spin and the portrait roll; `amount` fades the spin out
+   * while the user is dragging, the roll always eases.
+   */
   animate(time: number, amount: number): void;
   /** Uploads camera, model and pointer state for the current frame. */
   sync(): void;
+  /** Reframes for a new canvas aspect, which may also start the portrait roll. */
   setAspect(aspect: number): void;
+  /** Tilts the card about its own X axis, for the rim macro. Radians. */
+  setTilt(tilt: number): void;
   setPreset(preset: PresetName): void;
   /** Moves the cursor light; `intensity` 0 switches it off entirely. */
   setPointer(position: ScenePoint, intensity: number): void;
@@ -207,7 +253,21 @@ export function createCardScene(
   placeCamera();
 
   let spinYaw = 0;
+  let tilt = 0;
+  let roll = isPortrait(aspect) ? CARD_PORTRAIT_ROLL : 0;
+  let rollGoal = roll;
   let lastTime: number | undefined;
+
+  // `rotation` is intrinsic XYZ Euler, so this is Rx(tilt) * Ry(spin) *
+  // Rz(roll): the portrait roll turns the card in its own frame first, and the
+  // spin stays about the world (screen-vertical) axis on top of it. Rolling
+  // last instead would tip the spin axis over with the card and the flip would
+  // read as a somersault rather than a turn.
+  const placeCard = (): void => {
+    model.set({ rotation: [tilt, spinYaw, roll] });
+  };
+
+  placeCard();
 
   return {
     draw,
@@ -217,7 +277,12 @@ export function createCardScene(
       const delta = lastTime === undefined ? 0 : Math.max(0, time - lastTime);
       lastTime = time;
       spinYaw = (spinYaw + delta * SPIN_SPEED * amount) % (2 * Math.PI);
-      model.set({ rotation: [0, spinYaw, 0] });
+      if (Math.abs(rollGoal - roll) > 1e-4) {
+        roll += (rollGoal - roll) * (1 - Math.exp(-delta * ROLL_RATE));
+      } else {
+        roll = rollGoal;
+      }
+      placeCard();
     },
     sync(): void {
       draw.set({
@@ -229,6 +294,11 @@ export function createCardScene(
     setAspect(next: number): void {
       aspect = next;
       camera.set({ aspect: next });
+      rollGoal = isPortrait(next) ? CARD_PORTRAIT_ROLL : 0;
+    },
+    setTilt(next: number): void {
+      tilt = next;
+      placeCard();
     },
     setPreset(preset: PresetName): void {
       draw.set({ material: cardMaterial(preset) });

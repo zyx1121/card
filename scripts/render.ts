@@ -34,6 +34,7 @@ import {
   CARD_HERO_YAW,
   cardCameraDistance,
   createCardScene,
+  isPortrait,
   type VgpuApi,
 } from "@/lib/card-scene";
 import {
@@ -70,9 +71,16 @@ const BACKGROUND: readonly [number, number, number] = [0, 0, 0];
 const TRANSPARENT: readonly [number, number, number, number] = [0, 0, 0, 0];
 
 /** Which frames to shoot. */
-type ViewName = "hero" | "edge" | "back";
+type ViewName = "hero" | "edge" | "back" | "macro";
 
+/** The views `--all` shoots. */
 const VIEW_NAMES: readonly ViewName[] = ["hero", "edge", "back"];
+
+/**
+ * Views `--view` accepts. `macro` is a close-up of the name, where the relief
+ * bevel is wide enough to measure, so it is only shot on request.
+ */
+const SELECTABLE_VIEWS: readonly ViewName[] = [...VIEW_NAMES, "macro"];
 
 interface Args {
   readonly preset: PresetName;
@@ -109,7 +117,7 @@ function parseArgs(argv: readonly string[]): Args {
   const preset = resolvePreset(values.get("preset"));
   const view = values.get("view");
   const views =
-    view && VIEW_NAMES.includes(view as ViewName)
+    view && SELECTABLE_VIEWS.includes(view as ViewName)
       ? [view as ViewName]
       : VIEW_NAMES;
   const pointerArg = values.get("pointer");
@@ -298,7 +306,28 @@ function peakLuminance(
   return peak;
 }
 
-/** Etch mask value of the design at a point on the face, in millimetres. */
+/**
+ * How far one pixel departs from the mean of the box around it.
+ *
+ * The face carries a broad lighting gradient, so the grain has to be measured
+ * against the local mean rather than against the whole patch: this is the
+ * high-pass part of the signal, which is exactly the speckle.
+ */
+function localContrast(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  radius: number
+): number {
+  return (
+    luminance(pixels, (y * width + x) * 4) -
+    patchLuminance(pixels, width, height, x, y, radius, radius)
+  );
+}
+
+/** Mark mask value of the design at a point on the face, in millimetres. */
 function maskAt(
   design: Uint8Array,
   side: CardSide,
@@ -323,14 +352,19 @@ function maskAt(
 }
 
 interface FaceProbe {
-  /** Contrast between the bare coating and the etched floor. */
-  readonly etchContrast: number;
+  /** Contrast between the bare coating and the mark. */
+  readonly markContrast: number;
   /** p90 minus p10 of the bare coating, i.e. the gradient across the face. */
   readonly faceGradient: number;
   /** Width over height of the brightest patch on the bare coating. */
   readonly highlightRatio: number;
   readonly bare: number;
-  readonly etched: number;
+  readonly marked: number;
+  /**
+   * RMS of the per-pixel departure from the local mean on the bare coating:
+   * the sandblast speckle, with the lighting gradient filtered out.
+   */
+  readonly speckle: number;
   readonly samples: number;
 }
 
@@ -347,6 +381,7 @@ function probeFace(
   width: number,
   height: number,
   viewProjection: Float32Array,
+  model: Float32Array,
   design: Uint8Array,
   side: CardSide
 ): FaceProbe {
@@ -354,8 +389,10 @@ function probeFace(
   const inset = 1.5;
   const steps = 260;
   const bare: number[] = [];
-  const etched: number[] = [];
+  const marked: number[] = [];
   const bright: { x: number; y: number; value: number }[] = [];
+  let speckleSum = 0;
+  let speckleCount = 0;
 
   for (let iy = 0; iy <= steps; iy += 1) {
     const my =
@@ -372,29 +409,37 @@ function probeFace(
         maskAt(design, side, mx, my + 0.2),
         maskAt(design, side, mx, my - 0.2),
       ];
-      const isEtched = centre > 0.9 && neighbours.every((value) => value > 0.9);
+      const isMarked = centre > 0.9 && neighbours.every((value) => value > 0.9);
       const isBare = centre < 0.02 && neighbours.every((value) => value < 0.02);
-      if (!isEtched && !isBare) continue;
+      if (!isMarked && !isBare) continue;
 
-      const point = project(viewProjection, [mx, my, z], width, height);
+      const point = project(
+        viewProjection,
+        transformPoint(model, [mx, my, z]),
+        width,
+        height
+      );
       const px = Math.round(point.x);
       const py = Math.round(point.y);
       if (px < 0 || py < 0 || px >= width || py >= height) continue;
       const value = luminance(pixels, (py * width + px) * 4);
-      if (isEtched) {
-        etched.push(value);
+      if (isMarked) {
+        marked.push(value);
       } else {
         bare.push(value);
         bright.push({ x: px, y: py, value });
+        const detail = localContrast(pixels, width, height, px, py, 2);
+        speckleSum += detail * detail;
+        speckleCount += 1;
       }
     }
   }
 
   bare.sort((a, b) => a - b);
-  etched.sort((a, b) => a - b);
+  marked.sort((a, b) => a - b);
   const bareMedian = percentile(bare, 0.5);
-  // The darkest decile of the etch, which is its floor rather than its bevel.
-  const etchedFloor = percentile(etched, 0.1);
+  // The darkest decile of the mark, which is its body rather than its bevel.
+  const markFloor = percentile(marked, 0.1);
 
   const threshold = percentile(bare, 0.95);
   const box: Bounds = { minX: width, maxX: -1, minY: height, maxY: -1 };
@@ -409,12 +454,126 @@ function probeFace(
   const boxHeight = box.maxY - box.minY + 1;
 
   return {
-    etchContrast: Math.abs(bareMedian - etchedFloor),
+    markContrast: Math.abs(bareMedian - markFloor),
     faceGradient: percentile(bare, 0.9) - percentile(bare, 0.1),
     highlightRatio: boxHeight > 0 ? boxWidth / boxHeight : 0,
     bare: bareMedian,
-    etched: etchedFloor,
-    samples: bare.length + etched.length,
+    marked: markFloor,
+    speckle: speckleCount > 0 ? Math.sqrt(speckleSum / speckleCount) : 0,
+    samples: bare.length + marked.length,
+  };
+}
+
+/** Centre of the name on the front face, in card millimetres. */
+const NAME_CENTRE: readonly [number, number] = [-32, -16.9];
+
+/** Half extent of the box the relief probe walks, in millimetres. */
+const NAME_BOX: readonly [number, number] = [9, 4];
+
+interface ReliefProbe {
+  /** Mean luminance of the band just inside the mark's upper-left edge. */
+  readonly edge: number;
+  /** The same band on the lower-right, where the bevel faces the other way. */
+  readonly opposite: number;
+  /** Mean luminance of the mark's interior, away from any edge. */
+  readonly interior: number;
+  readonly edgeSamples: number;
+  readonly interiorSamples: number;
+}
+
+/**
+ * Reads the lips of a mark against its interior.
+ *
+ * The key light comes from upper-left, so which way the bevel faces is the
+ * whole question: a recess turns its upper-left wall away from the key, a
+ * relief turns it towards it.
+ *
+ * Absolute luminance at a lip cannot answer that on its own, because a lip
+ * pixel is partly the bright coating next to it whichever way the bevel faces.
+ * `edge - opposite`, the upper-left lip against the lower-right one, is the
+ * measurement that cancels that blend: both lips sit the same distance into
+ * the same mask edge, and only the bevel tells them apart.
+ *
+ * Every bucket is picked in card space from the mask itself, over the box
+ * around the name, so the classification never depends on a pixel threshold.
+ */
+function probeRelief(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  viewProjection: Float32Array,
+  model: Float32Array,
+  design: Uint8Array,
+  side: CardSide
+): ReliefProbe {
+  const z = (side === "front" ? 1 : -1) * (CARD_THICKNESS / 2);
+  // The lip is about two pixels wide at macro framing, which is 0.05 mm on the
+  // blank; the interior clearance is a whole stroke width.
+  const lip = 0.05;
+  const clear = 0.2;
+  const step = 0.02;
+  let edgeSum = 0;
+  let edgeCount = 0;
+  let oppositeSum = 0;
+  let oppositeCount = 0;
+  let interiorSum = 0;
+  let interiorCount = 0;
+
+  for (
+    let my = NAME_CENTRE[1] - NAME_BOX[1];
+    my <= NAME_CENTRE[1] + NAME_BOX[1];
+    my += step
+  ) {
+    for (
+      let mx = NAME_CENTRE[0] - NAME_BOX[0];
+      mx <= NAME_CENTRE[0] + NAME_BOX[0];
+      mx += step
+    ) {
+      if (maskAt(design, side, mx, my) < 0.9) continue;
+      const point = project(
+        viewProjection,
+        transformPoint(model, [mx, my, z]),
+        width,
+        height
+      );
+      const px = Math.round(point.x);
+      const py = Math.round(point.y);
+      if (px < 0 || py < 0 || px >= width || py >= height) continue;
+      const value = luminance(pixels, (py * width + px) * 4);
+      // Inside the mark but within a lip of its boundary. Up is +y on the
+      // blank and left is -x.
+      const upperLeft =
+        maskAt(design, side, mx - lip, my) < 0.5 ||
+        maskAt(design, side, mx, my + lip) < 0.5;
+      const lowerRight =
+        maskAt(design, side, mx + lip, my) < 0.5 ||
+        maskAt(design, side, mx, my - lip) < 0.5;
+      const buried =
+        maskAt(design, side, mx - clear, my) > 0.9 &&
+        maskAt(design, side, mx + clear, my) > 0.9 &&
+        maskAt(design, side, mx, my - clear) > 0.9 &&
+        maskAt(design, side, mx, my + clear) > 0.9;
+      // A stroke thin enough to be both lips at once tells the two apart from
+      // nothing, so it is dropped.
+      if (upperLeft && !lowerRight) {
+        edgeSum += value;
+        edgeCount += 1;
+      } else if (lowerRight && !upperLeft) {
+        oppositeSum += value;
+        oppositeCount += 1;
+      } else if (buried) {
+        interiorSum += value;
+        interiorCount += 1;
+      }
+    }
+  }
+
+  return {
+    edge: edgeCount > 0 ? edgeSum / edgeCount : 0,
+    opposite: oppositeCount > 0 ? oppositeSum / oppositeCount : 0,
+    interior: interiorCount > 0 ? interiorSum / interiorCount : 0,
+    edgeSamples: edgeCount,
+    interiorSamples: interiorCount,
   };
 }
 
@@ -449,6 +608,8 @@ interface ShotOptions {
   readonly sway: number;
   /** Tilt of the card itself about X, in radians. */
   readonly tilt?: number;
+  /** What the camera orbits and looks at; the card's centre by default. */
+  readonly target?: readonly [number, number, number];
   /** Cursor position as a viewport fraction; omitted leaves the lamp off. */
   readonly pointer?: readonly [number, number];
 }
@@ -515,17 +676,18 @@ async function main(): Promise<void> {
     shot: ShotOptions
   ): Promise<Uint8Array> => {
     const distance = shot.distance;
+    const target = shot.target ?? ([0, 0, 0] as const);
     card.camera.set({
       aspect,
       position: [
-        Math.sin(shot.yaw) * Math.cos(shot.pitch) * distance,
-        Math.sin(shot.pitch) * distance,
-        Math.cos(shot.yaw) * Math.cos(shot.pitch) * distance,
+        target[0] + Math.sin(shot.yaw) * Math.cos(shot.pitch) * distance,
+        target[1] + Math.sin(shot.pitch) * distance,
+        target[2] + Math.cos(shot.yaw) * Math.cos(shot.pitch) * distance,
       ],
     });
-    card.camera.lookAt([0, 0, 0]);
+    card.camera.lookAt(target);
+    card.setTilt(shot.tilt ?? 0);
     card.animate(0, shot.sway);
-    card.model.set({ rotation: [shot.tilt ?? 0, 0, 0] });
     card.setPointer(
       shot.pointer
         ? card.pointerPlanePoint(
@@ -580,6 +742,9 @@ async function main(): Promise<void> {
       };
       const hero = await shoot(card, { ...heroShot, pointer: args.pointer });
       const heroViewProjection = new Float32Array(card.camera.viewProjection);
+      // Portrait viewports roll the card, so the card-space grid the probes
+      // walk has to go through the model matrix like any other vertex.
+      const heroModel = new Float32Array(card.model.worldMatrix);
       writePng(path, hero, width, height);
       report.push(`frame_ms=${lastFrameMs.toFixed(1)}`);
 
@@ -588,14 +753,16 @@ async function main(): Promise<void> {
         width,
         height,
         heroViewProjection,
+        heroModel,
         designs.front,
         "front"
       );
       report.push(
         `face=${probe.bare.toFixed(4)}`,
-        `etch=${probe.etched.toFixed(4)}`,
-        `etch_contrast=${probe.etchContrast.toFixed(4)}`,
+        `mark=${probe.marked.toFixed(4)}`,
+        `mark_contrast=${probe.markContrast.toFixed(4)}`,
         `face_gradient=${probe.faceGradient.toFixed(4)}`,
+        `face_speckle=${probe.speckle.toFixed(5)}`,
         `highlight_ratio=${probe.highlightRatio.toFixed(2)}`,
         `probe_samples=${probe.samples}`
       );
@@ -628,10 +795,17 @@ async function main(): Promise<void> {
         sway: 0,
       });
       const flatBounds = silhouette(flat, width, height);
-      const flatAspect =
-        (flatBounds.maxX - flatBounds.minX + 1) /
-        (flatBounds.maxY - flatBounds.minY + 1);
-      report.push(`silhouette_aspect=${flatAspect.toFixed(4)}/1.6667`);
+      const flatWidth = flatBounds.maxX - flatBounds.minX + 1;
+      const flatAspect = flatWidth / (flatBounds.maxY - flatBounds.minY + 1);
+      // Portrait viewports roll the card a quarter turn, so the silhouette is
+      // the blank stood on its short side.
+      const wantedAspect = isPortrait(aspect)
+        ? CARD_HEIGHT / CARD_WIDTH
+        : CARD_WIDTH / CARD_HEIGHT;
+      report.push(
+        `silhouette_aspect=${flatAspect.toFixed(4)}/${wantedAspect.toFixed(4)}`,
+        `silhouette_width=${(flatWidth / width).toFixed(4)}`
+      );
       report.push(`-> ${path}`);
     }
 
@@ -644,18 +818,55 @@ async function main(): Promise<void> {
         sway: 0,
       });
       const backViewProjection = new Float32Array(card.camera.viewProjection);
+      const backModel = new Float32Array(card.model.worldMatrix);
       writePng(path, back, width, height);
       const probe = probeFace(
         back,
         width,
         height,
         backViewProjection,
+        backModel,
         designs.back,
         "back"
       );
       report.push(
-        `back_etch_contrast=${probe.etchContrast.toFixed(4)}`,
+        `back_mark_contrast=${probe.markContrast.toFixed(4)}`,
         `back_face_gradient=${probe.faceGradient.toFixed(4)}`,
+        `-> ${path}`
+      );
+    }
+
+    if (wanted.has("macro")) {
+      const path = single ? `${base}.png` : `${base}-macro.png`;
+      // The name at about four times hero scale, the only framing where the
+      // relief bevel is more than a pixel wide. Shot straight from the hero
+      // angle so the key still comes from upper-left.
+      const macro = await shoot(card, {
+        yaw: args.yaw ?? CARD_HERO_YAW,
+        pitch: CARD_HERO_PITCH,
+        distance: cardCameraDistance(aspect) / 4,
+        sway: 0,
+        target: [NAME_CENTRE[0], NAME_CENTRE[1], 0],
+      });
+      const macroViewProjection = new Float32Array(card.camera.viewProjection);
+      const macroModel = new Float32Array(card.model.worldMatrix);
+      writePng(path, macro, width, height);
+      const relief = probeRelief(
+        macro,
+        width,
+        height,
+        macroViewProjection,
+        macroModel,
+        designs.front,
+        "front"
+      );
+      report.push(
+        `relief_edge=${relief.edge.toFixed(4)}`,
+        `relief_opposite=${relief.opposite.toFixed(4)}`,
+        `relief_interior=${relief.interior.toFixed(4)}`,
+        `relief_delta=${(relief.edge - relief.interior).toFixed(4)}`,
+        `relief_facing=${(relief.edge - relief.opposite).toFixed(4)}`,
+        `relief_samples=${relief.edgeSamples}/${relief.interiorSamples}`,
         `-> ${path}`
       );
     }

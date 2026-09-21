@@ -18,6 +18,7 @@ import cardShader from "@/shaders/card.wgsl";
 import presentShader from "@/shaders/present.wgsl";
 
 import {
+  CARD_ROLL_EASE,
   cardCameraDistance,
   createCardScene,
   type VgpuApi,
@@ -155,7 +156,10 @@ export function startCard(
         },
       });
 
-      const distance = cardCameraDistance(initialWidth / initialHeight);
+      // Portrait and landscape frame the card differently, so the distance is
+      // refit whenever the canvas changes shape. It is a `let` because the
+      // intro and the pitch return both read the current framing.
+      let distance = cardCameraDistance(initialWidth / initialHeight);
       const controls = orbitControls(card.camera, {
         element: canvas,
         damping: 0.12,
@@ -221,12 +225,23 @@ export function startCard(
       window.addEventListener("pointercancel", onPointerUp);
       canvas.addEventListener("wheel", onWheel, { passive: true });
 
+      // A refit in flight: where the camera distance is coming from, where it
+      // is going and how far through the ease it is.
+      let refit: { from: number; to: number; elapsed: number } | undefined;
+
       const unsubscribeResize = canvasSurface.onResize((event) => {
         scene.resize([event.width, event.height]);
         // Binding a specific attachment does not follow a resize, so it is
         // rebound against the new generation.
         present.set({ scene: scene.colors[0] });
         card.setAspect(event.width / event.height);
+        const next = cardCameraDistance(event.width / event.height);
+        // Sub-millimetre refits are the browser rounding the canvas, not a new
+        // framing, and are not worth an ease.
+        if (Math.abs(next - distance) > 0.5) {
+          refit = { from: controls.distance, to: next, elapsed: 0 };
+          distance = next;
+        }
       });
 
       const applyTheme = () => {
@@ -258,6 +273,9 @@ export function startCard(
             distance: from + (distance - from) * eased,
           });
           if (introElapsed >= INTRO_DURATION) introDone = true;
+          // The intro already flies to the current framing, so a refit that
+          // lands mid-intro needs nothing of its own.
+          refit = undefined;
         } else if (!pointerDown) {
           sinceRelease += delta;
           const pitchError = homePitch - controls.pitch;
@@ -268,6 +286,16 @@ export function startCard(
                 pitchError * Math.min(1, delta * PITCH_RETURN_RATE),
             });
           }
+        }
+        if (refit) {
+          refit.elapsed += delta;
+          const eased = easeOutCubic(refit.elapsed / CARD_ROLL_EASE);
+          // `set()` moves state and goal together, so the visitor's own zoom is
+          // overridden for the length of the ease and then handed back.
+          controls.set({
+            distance: refit.from + (refit.to - refit.from) * eased,
+          });
+          if (refit.elapsed >= CARD_ROLL_EASE) refit = undefined;
         }
         controls.update(delta);
 

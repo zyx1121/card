@@ -1,8 +1,10 @@
-// Laser-etched white titanium card, the solid pass.
+// White titanium card with embossed marks, the solid pass.
 //
 // One shader covers all three faces. The front and back sample their design
-// texture, whose alpha is the etch mask: 1 where the laser has burned the white
-// ceramic coating away and left bare titanium, 0 where the coating is intact.
+// texture, whose alpha is the mark mask: 1 where the white ceramic coating
+// gives way to bare titanium, 0 where the coating is intact. `reliefDepth`
+// says which way that mark stands: negative is a laser cut into the coating,
+// positive is a raised relief proud of it.
 // The milled rim is shaded from its own albedo, metalness and roughness. The
 // material model itself lives in `pbr.wgsl`.
 //
@@ -19,12 +21,17 @@ import {
   Surface,
   grainNormal,
   shadeSurface,
-  sparkleNormal,
+  sparkle,
   srgbToLinear,
 } from "./pbr.wgsl";
 
 const FACE_FRONT: u32 = 0u;
 const FACE_BACK: u32 = 1u;
+
+// How much extra ambient a raised mark's top face collects. A relief stands
+// above the coating instead of hiding in it, so it gathers a little more of the
+// room than the surface around it rather than less.
+const RELIEF_LIFT: f32 = 0.12;
 
 struct Camera {
   viewProjection: mat4x4f,
@@ -77,7 +84,7 @@ fn vs_main(
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4f {
-  // The etch mask is read at the centre and one step to each side so its
+  // The mark mask is read at the centre and one step to each side so its
   // gradient can drive the bevel. Every sample sits outside any branch so the
   // mip derivatives stay uniform across the quad.
   let texel = 1.0 / vec2f(textureDimensions(frontDesign, 0));
@@ -132,7 +139,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4f {
   surface.anisotropy = anisotropy;
 
   // UV spot varnish: only the printed marks get the extra coat. Unused by the
-  // etched presets, where the mask means a cut rather than a coating.
+  // relief presets, where the mask means bare metal rather than a coating.
   let spot = coverage * material.spotGloss;
   surface.roughness = mix(surface.roughness, 0.07, spot * 0.9);
   surface.clearcoat = max(surface.clearcoat, spot);
@@ -146,33 +153,51 @@ fn fs_main(input: VertexOut) -> @location(0) vec4f {
 
   let grain = material.grain * (1.0 - spot * 0.8);
   var normal = grainNormal(geometricNormal, tangent, bitangent, input.uv, grain);
-  normal = sparkleNormal(
+  let grit = sparkle(
     normal, tangent, bitangent, input.uv,
     max(footprint.x, footprint.y),
     material.sparkle * (1.0 - coverage),
   );
+  normal = grit.normal;
+  surface.roughness = clamp(surface.roughness + grit.roughness, 0.03, 1.0);
 
-  // Laser recess: the coating is cut away, so the mask edge is a short wall
-  // down to the etch floor. The wall is faked from the mask gradient, scaled by
-  // the physical depth, and the floor picks up a little occlusion.
-  if (material.etch > 0.0) {
-    // The cut is only 0.03 mm deep, so this is a hairline wall, not a chamfer:
-    // pushed any harder the marks read as embossed chrome instead of a burn.
-    // The wall belongs to the cut, so it is weighted towards the inside.
+  // Relief: the mask edge is a short wall, faked from the mask gradient and
+  // scaled by the physical depth. Which way that wall faces is the sign of
+  // `reliefDepth`: into the surface for a laser cut, out of it for a raised
+  // mark. Either is a fraction of a tenth of a millimetre, so it is a lip and
+  // not a chamfer; pushed harder the marks read as machined chrome.
+  let raised = step(0.0, material.reliefDepth);
+  var foot = 0.0;
+  if (material.relief > 0.0) {
+    // A cut carries its wall on the inside, where the floor is; a relief
+    // carries it on the outside, at the foot where it meets the coating.
+    let wall = mix(0.3 + 0.7 * coverage, 1.0 - 0.7 * coverage, raised);
     let slope =
-      material.bevel * material.etch *
-      clamp(material.etchDepth * 40.0, 0.0, 2.0) *
-      (0.3 + 0.7 * coverage);
+      material.bevel * material.relief *
+      clamp(abs(material.reliefDepth) * 40.0, 0.0, 2.0) * wall;
+    // The mask gradient points into the mark, which is down the wall of a cut
+    // and up the wall of a relief.
+    let facing = mix(1.0, -1.0, raised);
     normal = normalize(
-      normal + (tangent * maskGradient.x + bitangent * maskGradient.y) * slope * 1.1
+      normal +
+        (tangent * maskGradient.x + bitangent * maskGradient.y) *
+        slope * facing * 1.1
     );
+    // The contact shadow of a raised mark, gathered in the crook just outside
+    // its foot. The gradient is the only thing that knows where that is.
+    foot = clamp(length(maskGradient) * 3.0, 0.0, 1.0) * (1.0 - coverage);
   }
-  let etchAo = 1.0 - material.etchAo * material.etch * coverage;
+  // A cut loses ambient on its floor; a relief loses it at its foot and gains a
+  // little on the top face it holds up to the room.
+  let occlusion =
+    1.0 -
+    material.reliefAo * material.relief * mix(coverage, foot, raised) +
+    RELIEF_LIFT * material.relief * raised * coverage;
 
   let shaded = shadeSurface(
     surface, normal, geometricNormal, tangent, bitangent,
     input.worldPosition, camera.position, pointer,
-    coverage, etchAo, material.exposure,
+    coverage, occlusion, material.exposure,
   );
 
   // Premultiplied, with the coverage in alpha: the composite lays this over the
